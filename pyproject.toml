@@ -3,7 +3,7 @@ requires = ["setuptools>=42"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "polyproject"
+name = "polyalign"
 version = "0.0.1"
 authors = [
 	{ name = "Richard Wheeler", email="richardwheeler@outlook.com" },

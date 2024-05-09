@@ -1,4 +1,4 @@
-import os, sys, subprocess, multiprocessing
+import os, sys, subprocess, random, multiprocessing
 
 """
 Polyalign
@@ -20,7 +20,7 @@ class BwaMem:
             raise ValueError("Program must be one of: "+", ".join(programs))
         self.cpus = cpus
         if self.cpus is None:
-            self.cpus = multiprocessing.cpu_count()
+            self.cpus = multiprocessing.cpu_count() / 2
         self.cpus = str(self.cpus)
         self.index_suffices = [".amb", ".ann", ".bwt", ".pac", ".nsq", ".pac", ".sa"]
         if do_indexing:
@@ -265,20 +265,23 @@ class AlignmentPair:
             return None
         if self.orientation() == self.correct_orientation:
             return True
-        return False
-        
+        return False    
 
 class Polyalign:
     """
     Object to handle separate exhaustive bwa alignments of left and right reads.
     Estimates insert size and returns sam of only accepted best pairings.
     """
-    def __init__(self, subject_path, reads_1_path, reads_2_path, output_path=".", output_basename="polyalign", read_orientation=None, insert_size_range=None, bwa_options={}, do_bwa_indexing=True):
+    def __init__(self, subject_path, reads_1_path, reads_2_path, output_path=".", output_basename="polyalign", output_type="filtered", read_orientation=None, insert_size_range=None, bwa_options={}, do_bwa_indexing=True):
         self.subject_path = subject_path
         self.reads_1_path = reads_1_path
         self.reads_2_path = reads_2_path
         self.output_path = output_path
         self.output_basename = output_basename
+        output_types = ["filtered", "paired"]
+        self.output_type = output_type
+        if self.output_type not in output_types:
+            raise ValueError("Output type must be one of: "+", ".join(output_types))
         # set necessary bwa options, -a and -Y flags
         bwa_options["a"] = None
         bwa_options["Y"] = None
@@ -291,9 +294,55 @@ class Polyalign:
             self.estimateInsertSizeRange()
 
     def isSinglePair(self, read_1, read_2):
+        """
+        Check if read_1 and read_2 have length 1, ie. single alignment of paired reads
+        """
         if len(read_1) == 1 and len(read_2) == 1:
             return True
         return False
+    
+    def isUnalignedPair(self, read_1, read_2):
+        """
+        Check if read_1 and read_2 are both unaligned, this can only occur when both are single alignments
+        """
+        if self.isSinglePair(read_1, read_2) and not Alignment(read_1[0]).aligned() and not Alignment(read_2[0]).aligned():
+            return True
+        return False
+    
+    def isOneUnalignedPair(self, read_1, read_2):
+        """
+        Check if one of read_1 or read_2 is unaligned, the unaligned read must be the first entry in either read_1 or read_2
+        """
+        if not Alignment(read_1[0]).aligned() or not Alignment(read_2[0]).aligned():
+            return True
+        return False
+    
+    def isGoodSinglePair(self, read_1, read_2):
+        """
+        Check if read_1 and read_2 are a good single pair, ie. align to the same reference, with the correct insert size, in the correct orientation
+        """
+        if self.isSinglePair(read_1, read_2):
+            read_pair = AlignmentPair(read_1[0], read_2[0], self.read_orientation, self.insert_size_range)
+            if read_pair.sameReference() and read_pair.correctInsertSize() and read_pair.correctOrientation():
+                return True
+        return False
+    
+    def findGoodPairs(self, read_1, read_2):
+        """
+        Find all good pairs of read_1 and read_2 alignments, pairs which align to the same reference, with the correct insert size, in the correct orientation
+        """
+        good_1, good_2 = [False] * len(read_1), [False] * len(read_2)
+        paired_1, paired_2 = [], []
+        for index_1, alignment_1 in enumerate(read_1):
+            for index_2, alignment_2 in enumerate(read_2):
+                if self.isGoodSinglePair([alignment_1], [alignment_2]):
+                    good_1[index_1] = True
+                    good_2[index_2] = True
+                    paired_1.append(alignment_1), paired_2.append(alignment_2)
+        if self.output_type == "filtered":
+            return [read_1[index] for index, value in enumerate(good_1) if value], [read_2[index] for index, value in enumerate(good_2) if value]
+        if self.output_type == "paired":
+            return paired_1, paired_2
     
     def estimateInsertSizeRange(self, read_sample = 100000, insert_size_percentile = 0.01):
         """
@@ -365,123 +414,173 @@ class Polyalign:
         """
         header_output = False
         stats = {
-            "unaligned": 0,
-            "single": 0,
-            "multiple incorrect": 0,
-            "multiple correct": 0,
+            "both unaligned": 0,
+            "single unaligned": 0,
+            "unique both aligned": 0,
+            "good pairs from multiple both aligned": 0,
+            "no good pairs from multiple both aligned": 0,
         }
         
         def printLine(line):
-            print("\t".join(line))
+            if line is not None:
+                print("\t".join(line))
         
         def printLines(lines):
-            for line in lines:
-                printLine(line)
+            if lines is not None:
+                for line in lines:
+                    printLine(line)
         
         def writeLine(file, line):
-            file.write("\t".join(line)+"\n")
+            if line is not None:
+                file.write("\t".join(line)+"\n")
         
         def writeLines(file, lines):
-            for line in lines:
-                writeLine(file, line)
+            if lines is not None:
+                for line in lines:
+                    writeLine(file, line)
                 
         def returnHeader():
             """
             Read input sams and return header lines
             """
-            return sam_1.readHeader(), sam_2.readHeader()
-        
-        def parsePairingPerRead(alignments, next_read, valid):
-            """
-            Parse pairing per read:
-            * For reads with zero alignments, discard sam line, no way to contribute to polishing.
-            * For reads with exactly one alignment, keep sam line, ie. treat unique alignments as correct.
-            * For reads with multiple alignments:
-                Keep sam line if it pairs (same ref seq, correct ori, good insert) with any of its pair's alignments.
-                Discard sam line otherwise.
-            """
-            if len(next_read) == 0:
-                return alignments
-            if len(valid) == 1:
-                alignments.append(next_read[0])
-                stats["single"] += 1
-            else:
-                master_alignment = next_read[0]
-                first = True
-                for index, alignment in enumerate(next_read):
-                    if first == True:
-                        next_read[index][9] = master_alignment[9]
-                        next_read[index][10] = master_alignment[10]
-                        first = False
-                    alignments.append(next_read[index])
-                if True in valid:
-                    stats["multiple correct"] += 1
-                else:
-                    stats["multiple incorrect"] += 1
-            return alignments
+            command = sys.argv.copy()
+            command[0] = os.path.basename(command[0])
+            program_line = ["@PG", "ID:PA", "PN:polyalign", "VN:0.0.0", "CL:"+" ".join(command)]
+            return sam_1.readHeader() + [program_line], sam_2.readHeader() + [program_line]
         
         def returnNextRead():
             """
             Read input sams, check for read alignment and return correctly paired reads.
+            Aims to copy Polypolish filtering: https://github.com/rrwick/Polypolish/blob/main/src/filter.rs alignment_pass_qc()
             """
             next_read_1 = sam_1.nextRead()
             next_read_2 = sam_2.nextRead()
             # no next read, return None
-            if next_read_1 is None:
+            if next_read_1 is None or next_read_2 is None:
                 return None, None
-            # setup output alignments
-            alignments_1 = []
-            alignments_2 = []
-            # change unaligned sam lines to empty lines, record as unaligned
-            if not Alignment(next_read_1[0]).aligned():
-                next_read_1 = []
-                stats["unaligned"] += 1
-            if not Alignment(next_read_2[0]).aligned():
-                next_read_2 = []
-                stats["unaligned"] += 1
-            # check pairing
-            valid_1 = [False] * len(next_read_1)
-            valid_2 = [False] * len(next_read_2)
-            for index_1, alignment_1 in enumerate(next_read_1):
-                for index_2, alignment_2 in enumerate(next_read_2):
-                    read_pair = AlignmentPair(alignment_1, alignment_2, self.read_orientation, self.insert_size_range)
-                    if read_pair.sameReference() and read_pair.correctInsertSize() and read_pair.correctOrientation():
-                        valid_1[index_1] = True
-                        valid_2[index_2] = True
-            # parse pairing and select reads for output
-            alignments_1 = parsePairingPerRead(alignments_1, next_read_1, valid_1)
-            alignments_2 = parsePairingPerRead(alignments_2, next_read_2, valid_2)
-            return alignments_1, alignments_2
+            # TODO: More consistent handling of read retention/discard, eg. just pop from list if not retained, and add support for setting ZP:Z:fail flag
+            # cache sequence, will need to be added back if we do not retain the first alignment
+            sequence_1, quality_1 = Alignment(next_read_1[0]).seq, Alignment(next_read_1[0]).qual
+            sequence_2, quality_2 = Alignment(next_read_2[0]).seq, Alignment(next_read_2[0]).qual
+            # check for read name mismatch
+            #if Alignment(next_read_1[0]).qname != Alignment(next_read_2[0]).qname:
+            #    print("-PA-", "Error: Read names do not match")
+            # check for no alignments
+            tempname = "SRR19895146.8"
+            if self.isUnalignedPair(next_read_1, next_read_2):
+                # For pairs where both have zero alignments, retain sam lines, but no way to contribute to polishing.
+                stats["both unaligned"] += 1
+                if retain_unmapped:
+                    return next_read_1, next_read_2
+                return [], []
+            if self.isOneUnalignedPair(next_read_1, next_read_2):
+                # For pairs with exactly one alignment of each read, keep sam lines, ie. treat unique paired alignments as correct.
+                stats["single unaligned"] += 1
+                return next_read_1, next_read_2
+            if self.isSinglePair(next_read_1, next_read_2):
+                # For pairs where one has zero alignments, keep sam lines, ie. treat single alignments as correct.
+                stats["unique both aligned"] += 1
+                return next_read_1, next_read_2
+            # For pairs with multiple alignments, keep sam lines if it pairs (same ref seq, correct ori, good insert) with any of its pair's alignments.
+            good_1, good_2 = self.findGoodPairs(next_read_1, next_read_2)
+            if len(good_1) == 0 or len(good_2) == 0:
+                stats["no good pairs from multiple both aligned"] += 1
+                return [], []
+            # add sequence and quality to first good reads, replace with "*" for the rest
+            for index, good in enumerate(good_1):
+                if index == 0:
+                    good[9] = sequence_1
+                    good[10] = quality_1
+                else:
+                    good[9] = "*"
+                    good[10] = "*"
+            for index, good in enumerate(good_2):
+                if index == 0:
+                    good[9] = sequence_2
+                    good[10] = quality_2
+                else:
+                    good[9] = "*"
+                    good[10] = "*"
+            stats["good pairs from multiple both aligned"] += 1
+            return good_1, good_2
+            """
+            # [broken] old code
+            next_read_1 = sam_1.nextRead()
+            next_read_2 = sam_2.nextRead()
+            if next_read_1 is None:
+                # no next read, return none
+                return None, None
+            if self.isSinglePair(next_read_1, next_read_2):
+                # single alignment for pair, so return if correct orientation and insert size
+                read_pair = AlignmentPair(next_read_1[0], next_read_2[0], correct_orientation=self.read_orientation, insert_size_range=self.insert_size_range)
+                if read_pair.sameReference() and read_pair.correctInsertSize() and read_pair.correctOrientation():
+                    return [next_read_1], [next_read_2]
+            else:
+                # multiple alignments for pair, filter for correct orientation and insert size, then return a random one
+                filtered_pairs = []
+                for read_1 in next_read_1:
+                    for read_2 in next_read_2:
+                        read_pair = AlignmentPair(read_1, read_2, correct_orientation=self.read_orientation, insert_size_range=self.insert_size_range)
+                        if read_pair.sameReference() and read_pair.correctInsertSize() and read_pair.correctOrientation():
+                            filtered_pairs.append((read_1, read_2))
+                if len(filtered_pairs) == 0:
+                    return [], []
+                read_1, read_2 = random.choice(filtered_pairs)
+                return [read_1], [read_2]
+            return [], []
+            """
         
         def nextOutput():
             if header_output == False:
                 return returnHeader()
-            return nextRead()
+            return returnNextRead()
         
+        print("-PA-", "Polyaligning in", self.output_type, "mode")
+        retain_unmapped = False
         read_index = 0
         # open output
-        file_1 = open(os.path.join(self.output_path, self.output_basename+"_1.sam"), "w")
-        file_2 = open(os.path.join(self.output_path, self.output_basename+"_2.sam"), "w")
+        if self.output_type == "filtered":
+            file_1 = open(os.path.join(self.output_path, self.output_basename+"_1.sam"), "w")
+            file_2 = open(os.path.join(self.output_path, self.output_basename+"_2.sam"), "w")
+            print("-PA-", "Output files:", self.output_basename+"_1.sam", self.output_basename+"_2.sam")
+        elif self.output_type == "paired":
+            if self.output_basename == "-":
+                file = sys.stdout
+                print("-PA-", "Outputting to stdout")
+            else:
+                file = open(os.path.join(self.output_path, self.output_basename+".sam"), "w")
+                print("-PA-", "Output file:", self.output_basename+".sam")
         # start alignment
         sam_1 = self.bwa_mem.mem(self.reads_1_path)
         sam_2 = self.bwa_mem.mem(self.reads_2_path)
-        # initialise output
+        # initialise input
         sam_1.readLine()
         sam_2.readLine()
         # header
         header_1, header_2 = returnHeader()
-        writeLines(file_1, header_1)
-        writeLines(file_2, header_2)
+        if self.output_type == "filtered":
+            writeLines(file_1, header_1)
+            writeLines(file_2, header_2)
+        elif self.output_type == "paired":
+            writeLines(file, header_1)
         # alignment and filtering
         alignment_1, alignment_2 = returnNextRead()
-        while alignment_1 is not None:
+        while alignment_1 is not None and alignment_2 is not None:
             read_index += 1
             if read_index % 10000 == 0:
                 print("-PA-", "Stats:", ", ".join([x[0]+": "+str(x[1]) for x in stats.items()]))
+            if self.output_type == "filtered":
+                writeLines(file_1, alignment_1)
+                writeLines(file_2, alignment_2)
+            elif self.output_type == "paired":
+                # TODO: Output is currently simple interleaving, but should set proper values...
+                # set [6] (rnext), [7] (pnext), sam flags [1]
+                writeLines(file, [x for a in zip(alignment_1, alignment_2) for x in a])
             alignment_1, alignment_2 = returnNextRead()
-            writeLines(file_1, alignment_1)
-            writeLines(file_2, alignment_2)
         # end output
-        print(stats)
-        file_1.close()
-        file_2.close()
+        if self.output_type == "filtered":
+            file_1.close()
+            file_2.close()
+        elif self.output_type == "paired":
+            if self.output_basename != "-":
+                file.close()

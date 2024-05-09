@@ -1,4 +1,28 @@
-export PATH=$PATH:~/sratoolkit/bin/
+if [ ! -d ~/sratoolkit ]; then
+  curl -L https://ftp-trace.ncbi.nlm.nih.gov/sra/sdk/3.1.0/sratoolkit.3.1.0-ubuntu64.tar.gz | tar jxf -
+  mv sratoolkit.3.1.0-ubuntu64 ~/sratoolkit
+fi
+
+if ! command -v cargo &> /dev/null; then
+  apt update && sudo apt install -y cargo
+fi
+
+if [ ! -d ~/polypolish ]; then
+  curl -L https://github.com/rrwick/Polypolish/releases/download/v0.6.0/polypolish-linux-x86_64-musl-v0.6.0.tar.gz | tar jxf -
+  mv polypolish-linux-x86_64-musl-v0.6.0 ~/polypolish
+fi
+
+if ! command -v bwa &> /dev/null; then
+  apt update && sudo apt install -y bwa
+fi
+
+if ! command -v git &> /dev/null; then
+  apt update && sudo apt install -y git
+fi
+
+export PATH=$PATH:~/sratoolkit/bin/:~/polypolish/target/release/
+
+python3 -m pip install git+https://github.com/zephyris/polyalign
 
 # get illumina data
 function fetchsra() {
@@ -16,4 +40,11 @@ if [ ! -f genome.fasta ]; then
   curl -L https://tritrypdb.org/common/downloads/release-68/LmexicanaMHOMGT2001U1103/fasta/data/TriTrypDB-68_LmexicanaMHOMGT2001U1103_Genome.fasta > genome.fasta
 fi
 
-python3 -m polyalign genome.fasta $illumina1 $illumina2 polyalign
+python3 -m polyalign filter genome.fasta $illumina1 $illumina2 polyalign
+polypolish polish genome.fasta polyalign_1.sam polyalign_2.sam > genome-polyalign.fasta
+
+bwa index genome.fasta
+bwa mem -a -Y -t 40 genome.fasta $illumina1 > bwa_1.sam
+bwa mem -a -Y -t 40 genome.fasta $illumina2 > bwa_2.sam
+polypolish filter --in1 bwa_1.sam --in2 bwa_2.sam --out1 bwa_1_filtered.sam --out2 bwa_2_filtered.sam
+polypolish polish genome.fasta bwa_1_filtered.sam bwa_2_filtered.sam > genome-polypolish_filter.fasta
