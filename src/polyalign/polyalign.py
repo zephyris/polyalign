@@ -1,0 +1,487 @@
+import os, sys, subprocess, multiprocessing
+
+"""
+Polyalign
+Polyalign is a a wrapper for bwa mem (and bwa-mem2) with improved read pairing.
+Left and right reads are aligned separately, and all pairings with correct insert size are returned.
+"""
+
+class BwaMem:
+    """
+    Object to handle bwa index indexing and bwa mem alignment.
+    Handles either input fastq files or lists of lines, outputing sam output lines (as split lists) as an iterator.
+    """
+    def __init__(self, subject_path, options={}, program="bwa", do_indexing=True, cpus=None):
+        self.subject_path = subject_path
+        self.options = options
+        programs = ["bwa", "bwa-mem2"]
+        self.program = program
+        if program not in programs:
+            raise ValueError("Program must be one of: "+", ".join(programs))
+        self.cpus = cpus
+        if self.cpus is None:
+            self.cpus = multiprocessing.cpu_count()
+        self.cpus = str(self.cpus)
+        self.index_suffices = [".amb", ".ann", ".bwt", ".pac", ".nsq", ".pac", ".sa"]
+        if do_indexing:
+            self.makeIndex()
+    
+    def checkBwa(self):
+        """
+        Calls the program to check that it exists.
+        """
+        try:
+            subprocess.run([self.program, "mem", "help"], stdout=subprocess.PIPE)
+        except OSError:
+            print("-PA-", "Error: " + self.program + " not found")
+
+    def makeIndex(self):
+        """
+        Index subject_path fasta file using bwa index.
+        """
+        subprocess.run([self.program, "index", self.subject_path])
+    
+    def removeIndex(self):
+        """
+        Removes index files for subject_path.
+        """
+        for suffix in self.index_suffices:
+            try:
+                os.remove(self.subject_path + suffix)
+            except FileNotFoundError:
+                pass
+    
+    class SamLineIterator:
+        """
+        Iterator object for returning sam lines as lists, with simple caching of current value.
+        """
+        def __init__(self, iterator):
+            self.iterator = iterator
+            self.current = None
+            self.current_id = None
+            self.previous = None
+            self.previous_id = None
+        
+        def __iter__(self):
+            return self
+        
+        def __next__(self):
+            try:
+                self.previous = self.current
+                self.previous_id = self.current_id
+                self.current = self.convert(next(self.iterator))
+                if self.current == [""]:
+                    raise StopIteration
+                if self.current[0][0] != "@":
+                    self.current_id = self.current[0]
+                else:
+                    self.current_id = None
+            except StopIteration:
+                self.current = None
+                self.current_id = None
+            finally:
+                return self.current
+        
+        def convert(self, entry):
+            """
+            Convert bytestream to line split by tab delimitation.
+            """
+            if entry is None:
+                return None
+            return entry.decode("utf-8").strip().split("\t")
+        
+        def readLine(self):
+            """
+            Read and return the next line
+            """
+            return next(self)
+        
+        def readHeader(self):
+            """
+            Read and return all header lines as a list of lists
+            Does not read first line, should be run after next(<SamLineIterator instance>) or readLine()
+            """
+            line = self.current
+            if line is None:
+                return None
+            lines = [line.copy()]
+            while next(self) is not None and self.current[0][0] == "@":
+                lines.append(self.current.copy())
+            return lines
+        
+        def nextRead(self):
+            """
+            Return list of all sam lines for next read id as a list of lists
+            Does not check for header lines, should be run after readHeader()
+            """
+            line = self.current
+            if line is None:
+                return None
+            lines = [line.copy()]
+            while next(self) is not None and lines[0][0]==self.current_id:
+                lines.append(self.current.copy())
+            return lines
+    
+    def mem(self, reads_1_path, reads_2_path=None):
+        """
+        Do alignment using bwa mem of reads_1_path (and optionally reads_2_path).
+        """
+        command = [self.program, "mem", "-t", self.cpus, self.subject_path]
+        for option in self.options:
+            if self.options[option] is not None:
+                command += ["-" + option, self.options[option]]
+            else:
+                command += ["-" + option]
+        command += [reads_1_path]
+        if reads_2_path is not None:
+            command += [reads_2_path]
+        print("-PA-", "bwa mem command:", " ".join(command))
+        process = subprocess.Popen(command, stdout=subprocess.PIPE)
+        return self.SamLineIterator(iter(process.stdout.readline, ""))
+    
+    def memString(self, reads_1_lines, reads_2_lines=None, temp_directory_path=None, options={}):
+        """
+        Do alignment using bwa mem of list of data lines reads_1_lines (and optionally reads_2_lines)
+        Construct temporary input files to do searching in temp_path.
+        """
+        if temp_directory_path is None:
+            temp_directory_path = os.path.dirname(self.subject_path)
+        files = {"1": {"data": reads_1_lines}}
+        if reads_2_lines is not None:
+            files = {"2": {"data": reads_2_lines}}
+        for key in files:
+            files[key]["path"] = os.path.join(temp_directory_path, "reads_temp_"+key+".fastq")
+            with open(files[key]["path"], "w") as file:
+                for line in files[key]["data"]:
+                    file.write(line + "\n")
+        if reads_2_lines is not None:
+            self.mem(files["1"]["path"], files["2"]["path"], options)
+        else:
+            self.mem(files["1"]["path"], options)
+
+class Alignment:
+    """
+    Object to contain read data as derived from sam-formatted line
+    https://samtools.github.io/hts-specs/SAMv1.pdf
+    """
+    def __init__(self, sam_line):
+        self.qname = sam_line[0]
+        self.flag = int(sam_line[1])
+        self.rname = sam_line[2]
+        self.pos = int(sam_line[3])
+        self.mapq = int(sam_line[4])
+        self.cigar = sam_line[5]
+        self.tlen = int(sam_line[8])
+        self.seq = sam_line[9]
+        self.qual = sam_line[10]
+    
+    def position(self):
+        """
+        0 indexed start, end position tuple
+        start < end for forward, start > end for reverse
+        """
+        start, end = self.pos - 1, self.pos - 1 + self.tlen
+        if self.orientation() == "f":
+            return start, end
+        return end, start
+        
+    def leftmostPosition(self):
+        return min(self.position())
+        
+    def rightmostPosition(self):
+        return max(self.position())
+    
+    def orientation(self):
+        """
+        f for forward, r for reverse
+        """
+        if self.flag & 0x10 == 0:
+            return "f"
+        return "r"
+    
+    def aligned(self):
+        if self.rname == "*":
+            return False
+        return True
+
+class AlignmentPair:
+    """
+    Properties about a mate pair alignment from two sam-formatted lines
+    """
+    def __init__(self, read_1, read_2, correct_orientation=None, insert_size_range=None):
+        self.read_1 = Alignment(read_1)
+        self.read_2 = Alignment(read_2)
+        self.correct_orientation = correct_orientation
+        self.insert_size_range = insert_size_range
+    
+    def sameReference(self):
+        """
+        Aligned to the same reference
+        """
+        if self.read_1.rname == "*" or self.read_2.rname == "*":
+            # one or both not aligned
+            return False
+        if self.read_1.rname == self.read_2.rname:
+            # matching reference name
+            return True
+        return False
+    
+    def insertSize(self):
+        """
+        Insert size, from alignment coordinates
+        """
+        if not self.sameReference():
+            return None
+        return max(self.read_1.rightmostPosition(), self.read_2.rightmostPosition()) - min(self.read_1.leftmostPosition(), self.read_2.leftmostPosition())
+
+    def orientation(self):
+        """
+        Pair orientation: fr, ff, rr or rf
+        """
+        if self.read_1.rname == "*" or self.read_2.rname == "*":
+            # one or both not aligned
+            return None
+        if self.read_1.leftmostPosition() < self.read_2.leftmostPosition():
+            return self.read_1.orientation() + self.read_2.orientation()
+        return self.read_2.orientation() + self.read_1.orientation()
+    
+    def correctInsertSize(self):
+        """
+        Is the insert size within the expected range
+        """
+        if self.insert_size_range is None:
+            return None
+        if self.insertSize() is None:
+            return False
+        if self.insert_size_range[0] < self.insertSize() < self.insert_size_range[1]:
+            return True
+        return False
+    
+    def correctOrientation(self):
+        """
+        Is the mate pair oriented correctly
+        """
+        if self.correct_orientation is None:
+            return None
+        if self.orientation() == self.correct_orientation:
+            return True
+        return False
+        
+
+class Polyalign:
+    """
+    Object to handle separate exhaustive bwa alignments of left and right reads.
+    Estimates insert size and returns sam of only accepted best pairings.
+    """
+    def __init__(self, subject_path, reads_1_path, reads_2_path, output_path=".", output_basename="polyalign", read_orientation=None, insert_size_range=None, bwa_options={}, do_bwa_indexing=True):
+        self.subject_path = subject_path
+        self.reads_1_path = reads_1_path
+        self.reads_2_path = reads_2_path
+        self.output_path = output_path
+        self.output_basename = output_basename
+        # set necessary bwa options, -a and -Y flags
+        bwa_options["a"] = None
+        bwa_options["Y"] = None
+        # initialise bwa mem
+        self.bwa_mem = BwaMem(subject_path, bwa_options, do_indexing=do_bwa_indexing)
+        # set read orientation and insert size, fetching automatically if necessary
+        self.read_orientation = read_orientation
+        self.insert_size_range = insert_size_range
+        if self.read_orientation is None or self.insert_size_range is None:
+            self.estimateInsertSizeRange()
+
+    def isSinglePair(self, read_1, read_2):
+        if len(read_1) == 1 and len(read_2) == 1:
+            return True
+        return False
+    
+    def estimateInsertSizeRange(self, read_sample = 100000, insert_size_percentile = 0.01):
+        """
+        Using a sample of read_sample reads, estimate insert size distribution.
+        Return an acceptable size range of 1st to 99th percentile.
+        """
+        def sampleReads(input_path, output_path, read_sample):
+            with open(input_path, "r") as input_file:
+                with open(output_path, "w") as output_file:
+                    count = 0
+                    while count < read_sample * 4:
+                        line = input_file.readline()
+                        if not line:
+                            break
+                        output_file.write(line)
+                        count += 1
+        
+        print("-PA-", "Getting mate pair properties from read subset alignment")
+        # output stats
+        insert_size = []
+        orientation = {"fr": 0, "ff": 0, "rr": 0, "rf": 0}
+        # sample reads
+        print("-PA-", "Sampling "+str(read_sample)+" reads")
+        sampleReads(self.reads_1_path, "tmp1.fastq.tmp", read_sample)
+        sampleReads(self.reads_2_path, "tmp2.fastq.tmp", read_sample)
+        # do alignment
+        sam_1 = self.bwa_mem.mem("tmp1.fastq.tmp")
+        sam_2 = self.bwa_mem.mem("tmp2.fastq.tmp")
+        # get stats
+        # read and ignore header lines
+        sam_1.readLine()
+        sam_1.readHeader()
+        sam_2.readLine()
+        sam_2.readHeader()
+        # iterate through sets of alignment for each read
+        next_read_1 = sam_1.nextRead()
+        next_read_2 = sam_2.nextRead()
+        while next_read_1 is not None:
+            # if a single pair
+            if self.isSinglePair(next_read_1, next_read_2):
+                # get and record statsenumerate
+                read_pair = AlignmentPair(next_read_1[0], next_read_2[0])
+                if read_pair.sameReference():
+                    insert_size.append(read_pair.insertSize())
+                    orientation[read_pair.orientation()] += 1
+            next_read_1 = sam_1.nextRead()
+            next_read_2 = sam_2.nextRead()
+        # analyse insert_size
+        insert_size.sort()
+        insert_lower = insert_size[int(len(insert_size) * insert_size_percentile)]
+        insert_upper = insert_size[int(len(insert_size) * (1 - insert_size_percentile))]
+        # print result
+        print("-PA-", "Result:")
+        print("-PA-", "Insert size "+str(insert_size_percentile * 100)+"% and "+str(100 - insert_size_percentile * 100)+"% percentile:", insert_lower, insert_upper)
+        print("-PA-", "Orientation:", ", ".join([x[0]+": "+str(x[1]) for x in orientation.items()]))
+        # set properties
+        if self.read_orientation is None:
+            self.read_orientation = max(orientation, key=orientation.get)
+        if self.insert_size_range is None:
+            self.insert_size_range = (insert_lower, insert_upper)
+        # remove temporary files
+        os.remove("tmp1.fastq.tmp")
+        os.remove("tmp2.fastq.tmp")
+
+    def polyalign(self):
+        """
+        Do the polyalignment.
+        Aligns left and right reads separately, parsing output for all possible correct pairings.
+        """
+        header_output = False
+        stats = {
+            "unaligned": 0,
+            "single": 0,
+            "multiple incorrect": 0,
+            "multiple correct": 0,
+        }
+        
+        def printLine(line):
+            print("\t".join(line))
+        
+        def printLines(lines):
+            for line in lines:
+                printLine(line)
+        
+        def writeLine(file, line):
+            file.write("\t".join(line)+"\n")
+        
+        def writeLines(file, lines):
+            for line in lines:
+                writeLine(file, line)
+                
+        def returnHeader():
+            """
+            Read input sams and return header lines
+            """
+            return sam_1.readHeader(), sam_2.readHeader()
+        
+        def parsePairingPerRead(alignments, next_read, valid):
+            """
+            Parse pairing per read:
+            * For reads with zero alignments, discard sam line, no way to contribute to polishing.
+            * For reads with exactly one alignment, keep sam line, ie. treat unique alignments as correct.
+            * For reads with multiple alignments:
+                Keep sam line if it pairs (same ref seq, correct ori, good insert) with any of its pair's alignments.
+                Discard sam line otherwise.
+            """
+            if len(next_read) == 0:
+                return alignments
+            if len(valid) == 1:
+                alignments.append(next_read[0])
+                stats["single"] += 1
+            else:
+                master_alignment = next_read[0]
+                first = True
+                for index, alignment in enumerate(next_read):
+                    if first == True:
+                        next_read[index][9] = master_alignment[9]
+                        next_read[index][10] = master_alignment[10]
+                        first = False
+                    alignments.append(next_read[index])
+                if True in valid:
+                    stats["multiple correct"] += 1
+                else:
+                    stats["multiple incorrect"] += 1
+            return alignments
+        
+        def returnNextRead():
+            """
+            Read input sams, check for read alignment and return correctly paired reads.
+            """
+            next_read_1 = sam_1.nextRead()
+            next_read_2 = sam_2.nextRead()
+            # no next read, return None
+            if next_read_1 is None:
+                return None, None
+            # setup output alignments
+            alignments_1 = []
+            alignments_2 = []
+            # change unaligned sam lines to empty lines, record as unaligned
+            if not Alignment(next_read_1[0]).aligned():
+                next_read_1 = []
+                stats["unaligned"] += 1
+            if not Alignment(next_read_2[0]).aligned():
+                next_read_2 = []
+                stats["unaligned"] += 1
+            # check pairing
+            valid_1 = [False] * len(next_read_1)
+            valid_2 = [False] * len(next_read_2)
+            for index_1, alignment_1 in enumerate(next_read_1):
+                for index_2, alignment_2 in enumerate(next_read_2):
+                    read_pair = AlignmentPair(alignment_1, alignment_2, self.read_orientation, self.insert_size_range)
+                    if read_pair.sameReference() and read_pair.correctInsertSize() and read_pair.correctOrientation():
+                        valid_1[index_1] = True
+                        valid_2[index_2] = True
+            # parse pairing and select reads for output
+            alignments_1 = parsePairingPerRead(alignments_1, next_read_1, valid_1)
+            alignments_2 = parsePairingPerRead(alignments_2, next_read_2, valid_2)
+            return alignments_1, alignments_2
+        
+        def nextOutput():
+            if header_output == False:
+                return returnHeader()
+            return nextRead()
+        
+        read_index = 0
+        # open output
+        file_1 = open(os.path.join(self.output_path, self.output_basename+"_1.sam"), "w")
+        file_2 = open(os.path.join(self.output_path, self.output_basename+"_2.sam"), "w")
+        # start alignment
+        sam_1 = self.bwa_mem.mem(self.reads_1_path)
+        sam_2 = self.bwa_mem.mem(self.reads_2_path)
+        # initialise output
+        sam_1.readLine()
+        sam_2.readLine()
+        # header
+        header_1, header_2 = returnHeader()
+        writeLines(file_1, header_1)
+        writeLines(file_2, header_2)
+        # alignment and filtering
+        alignment_1, alignment_2 = returnNextRead()
+        while alignment_1 is not None:
+            read_index += 1
+            if read_index % 10000 == 0:
+                print("-PA-", "Stats:", ", ".join([x[0]+": "+str(x[1]) for x in stats.items()]))
+            alignment_1, alignment_2 = returnNextRead()
+            writeLines(file_1, alignment_1)
+            writeLines(file_2, alignment_2)
+        # end output
+        print(stats)
+        file_1.close()
+        file_2.close()

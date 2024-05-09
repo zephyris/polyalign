@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=42"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "polyproject"
+version = "0.0.1"
+authors = [
+	{ name = "Richard Wheeler", email="richardwheeler@outlook.com" },
+]
+description = "Polyalign is a a wrapper for bwa mem (and bwa-mem2) with improved read pairing."
+readme = "README.md"
+requires-python = ">=3.8"
+dependencies = [
+]
+
+[project.urls]
+"Homepage" = "https://github.com/zephyris/polyalign"

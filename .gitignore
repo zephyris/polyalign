@@ -1,0 +1,25 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# fasta, fastq and bwa indexes
+*.fasta
+*.fastq
+*.amb
+*.ann
+*.bwt
+*.pac
+*.nsq
+*.pac
+*.sa
+
+# outputs
+*.sam
+*.bam
+
+# build
+build/
+
+# egg-info
+*.egg-info/
