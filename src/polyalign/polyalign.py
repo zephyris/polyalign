@@ -22,7 +22,7 @@ class BwaMem:
         if self.cpus is None:
             self.cpus = multiprocessing.cpu_count() / 2
         self.cpus = str(self.cpus)
-        self.index_suffices = [".amb", ".ann", ".bwt", ".pac", ".nsq", ".pac", ".sa"]
+        self.index_suffices = [".amb", ".ann", ".bwt", ".pac", ".sa"]
         if do_indexing:
             self.makeIndex()
     
@@ -39,7 +39,14 @@ class BwaMem:
         """
         Index subject_path fasta file using bwa index.
         """
-        subprocess.run([self.program, "index", self.subject_path])
+        index_exists = True
+        for suffix in self.index_suffices:
+            if not os.path.exists(self.subject_path + suffix):
+                index_exists = False
+                print("-PA-", "Index files not found,", self.subject_path + suffix, "missing")
+                break
+        if not index_exists:
+            subprocess.run([self.program, "index", self.subject_path])
     
     def removeIndex(self):
         """
@@ -107,7 +114,7 @@ class BwaMem:
             lines = [line.copy()]
             while next(self) is not None and self.current[0][0] == "@":
                 lines.append(self.current.copy())
-            return lines
+            return [Header(line) for line in lines]
         
         def nextRead(self):
             """
@@ -120,7 +127,7 @@ class BwaMem:
             lines = [line.copy()]
             while next(self) is not None and lines[0][0]==self.current_id:
                 lines.append(self.current.copy())
-            return lines
+            return [Alignment(line) for line in lines]
     
     def mem(self, reads_1_path, reads_2_path=None):
         """
@@ -159,6 +166,25 @@ class BwaMem:
         else:
             self.mem(files["1"]["path"], options)
 
+class Header:
+    """
+    Object to contain sam header data
+    """
+    def __init__(self, sam_line):
+        self.line = sam_line
+
+    def __str__(self):
+        """
+        Return sam line as a string
+        """
+        return "\t".join(self.columns())
+
+    def columns(self):
+        """
+        Sam line as a list of strings for each column
+        """
+        return self.line
+
 class Alignment:
     """
     Object to contain read data as derived from sam-formatted line
@@ -171,10 +197,26 @@ class Alignment:
         self.pos = int(sam_line[3])
         self.mapq = int(sam_line[4])
         self.cigar = sam_line[5]
+        self.rnext = sam_line[6]
+        self.pnext = int(sam_line[7])
         self.tlen = int(sam_line[8])
         self.seq = sam_line[9]
         self.qual = sam_line[10]
+        self.optional = sam_line[11:]
+        self.flag_indices = ["primary", "properly_aligned", "unmapped", "mate_unmapped", "reverse", "mate_reverse", "first", "second", "secondary", "qc_fail", "duplicate", "supplementary"]
     
+    def __str__(self):
+        """
+        Return sam line as a string
+        """
+        return "\t".join(self.columns())
+    
+    def columns(self):
+        """
+        Sam line as a list of strings for each column
+        """
+        return [self.qname, str(self.flag), self.rname, str(self.pos), str(self.mapq), self.cigar, self.rnext, str(self.pnext), str(self.tlen), self.seq, self.qual] + self.optional
+
     def position(self):
         """
         0 indexed start, end position tuple
@@ -184,7 +226,45 @@ class Alignment:
         if self.orientation() == "f":
             return start, end
         return end, start
-        
+    
+    def getFlags(self):
+        """
+        Flags as a dict of boolean values
+        """
+        flags = {}
+        for index, flag in enumerate(self.flag_indices):
+            flags[flag] = self.flag & 2**index != 0
+        return flags
+
+    def setFlags(self, flags):
+        """
+        Set flags from a dict of boolean values
+        """
+        for index, flag in enumerate(self.flag_indices):
+            if flags[flag]:
+                self.flag |= 2**index
+            else:
+                self.flag &= ~2**index
+    
+    def setFlag(self, flag, value):
+        """
+        Set a single flag by name
+        """
+        index = self.flag_indices.index(flag)
+        if value:
+            self.flag |= 2**index
+        else:
+            self.flag &= ~2**index
+    
+    def setOptional(self, tag, value, typechar="Z"):
+        """
+        Add an optional field to the end of the line
+        """
+        for entry in self.optional:
+            if entry.split(":")[0] == tag:
+                self.optional.remove(entry)
+        self.optional.append(tag + ":" + typechar + ":" + value)
+
     def leftmostPosition(self):
         return min(self.position())
         
@@ -209,8 +289,8 @@ class AlignmentPair:
     Properties about a mate pair alignment from two sam-formatted lines
     """
     def __init__(self, read_1, read_2, correct_orientation=None, insert_size_range=None):
-        self.read_1 = Alignment(read_1)
-        self.read_2 = Alignment(read_2)
+        self.read_1 = read_1
+        self.read_2 = read_2
         self.correct_orientation = correct_orientation
         self.insert_size_range = insert_size_range
     
@@ -305,7 +385,7 @@ class Polyalign:
         """
         Check if read_1 and read_2 are both unaligned, this can only occur when both are single alignments
         """
-        if self.isSinglePair(read_1, read_2) and not Alignment(read_1[0]).aligned() and not Alignment(read_2[0]).aligned():
+        if self.isSinglePair(read_1, read_2) and not read_1[0].aligned() and not read_2[0].aligned():
             return True
         return False
     
@@ -313,7 +393,7 @@ class Polyalign:
         """
         Check if one of read_1 or read_2 is unaligned, the unaligned read must be the first entry in either read_1 or read_2
         """
-        if not Alignment(read_1[0]).aligned() or not Alignment(read_2[0]).aligned():
+        if not read_1[0].aligned() or not read_2[0].aligned():
             return True
         return False
     
@@ -423,7 +503,7 @@ class Polyalign:
         
         def printLine(line):
             if line is not None:
-                print("\t".join(line))
+                print(str(line))
         
         def printLines(lines):
             if lines is not None:
@@ -432,7 +512,7 @@ class Polyalign:
         
         def writeLine(file, line):
             if line is not None:
-                file.write("\t".join(line)+"\n")
+                file.write(str(line)+"\n")
         
         def writeLines(file, lines):
             if lines is not None:
@@ -459,14 +539,10 @@ class Polyalign:
             if next_read_1 is None or next_read_2 is None:
                 return None, None
             # TODO: More consistent handling of read retention/discard, eg. just pop from list if not retained, and add support for setting ZP:Z:fail flag
-            # cache sequence, will need to be added back if we do not retain the first alignment
-            sequence_1, quality_1 = Alignment(next_read_1[0]).seq, Alignment(next_read_1[0]).qual
-            sequence_2, quality_2 = Alignment(next_read_2[0]).seq, Alignment(next_read_2[0]).qual
             # check for read name mismatch
             #if Alignment(next_read_1[0]).qname != Alignment(next_read_2[0]).qname:
             #    print("-PA-", "Error: Read names do not match")
             # check for no alignments
-            tempname = "SRR19895146.8"
             if self.isUnalignedPair(next_read_1, next_read_2):
                 # For pairs where both have zero alignments, retain sam lines, but no way to contribute to polishing.
                 stats["both unaligned"] += 1
@@ -489,46 +565,20 @@ class Polyalign:
             # add sequence and quality to first good reads, replace with "*" for the rest
             for index, good in enumerate(good_1):
                 if index == 0:
-                    good[9] = sequence_1
-                    good[10] = quality_1
+                    good.seq = next_read_1[0].seq
+                    good.qual = next_read_1[0].qual
                 else:
-                    good[9] = "*"
-                    good[10] = "*"
+                    good.seq = "*"
+                    good.qual = "*"
             for index, good in enumerate(good_2):
                 if index == 0:
-                    good[9] = sequence_2
-                    good[10] = quality_2
+                    good.seq = next_read_2[0].seq
+                    good.qual = next_read_1[0].qual
                 else:
-                    good[9] = "*"
-                    good[10] = "*"
+                    good.seq = "*"
+                    good.qual = "*"
             stats["good pairs from multiple both aligned"] += 1
             return good_1, good_2
-            """
-            # [broken] old code
-            next_read_1 = sam_1.nextRead()
-            next_read_2 = sam_2.nextRead()
-            if next_read_1 is None:
-                # no next read, return none
-                return None, None
-            if self.isSinglePair(next_read_1, next_read_2):
-                # single alignment for pair, so return if correct orientation and insert size
-                read_pair = AlignmentPair(next_read_1[0], next_read_2[0], correct_orientation=self.read_orientation, insert_size_range=self.insert_size_range)
-                if read_pair.sameReference() and read_pair.correctInsertSize() and read_pair.correctOrientation():
-                    return [next_read_1], [next_read_2]
-            else:
-                # multiple alignments for pair, filter for correct orientation and insert size, then return a random one
-                filtered_pairs = []
-                for read_1 in next_read_1:
-                    for read_2 in next_read_2:
-                        read_pair = AlignmentPair(read_1, read_2, correct_orientation=self.read_orientation, insert_size_range=self.insert_size_range)
-                        if read_pair.sameReference() and read_pair.correctInsertSize() and read_pair.correctOrientation():
-                            filtered_pairs.append((read_1, read_2))
-                if len(filtered_pairs) == 0:
-                    return [], []
-                read_1, read_2 = random.choice(filtered_pairs)
-                return [read_1], [read_2]
-            return [], []
-            """
         
         def nextOutput():
             if header_output == False:
@@ -567,7 +617,7 @@ class Polyalign:
         alignment_1, alignment_2 = returnNextRead()
         while alignment_1 is not None and alignment_2 is not None:
             read_index += 1
-            if read_index % 10000 == 0:
+            if read_index % 100000 == 0:
                 print("-PA-", "Stats:", ", ".join([x[0]+": "+str(x[1]) for x in stats.items()]))
             if self.output_type == "filtered":
                 writeLines(file_1, alignment_1)
