@@ -40,7 +40,7 @@ if [ ! -f genome.fasta ]; then
   curl -L https://tritrypdb.org/common/downloads/release-68/LmexicanaMHOMGT2001U1103/fasta/data/TriTrypDB-68_LmexicanaMHOMGT2001U1103_Genome.fasta > genome.fasta
 fi
 
-python3 -m polyalign filter genome.fasta $illumina1 $illumina2 polyalign
+python3 -m polyalign filtered genome.fasta $illumina1 $illumina2 polyalign
 polypolish polish genome.fasta polyalign_1.sam polyalign_2.sam > genome-polyalign.fasta
 
 bwa index genome.fasta
