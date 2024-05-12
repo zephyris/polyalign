@@ -1,4 +1,5 @@
-import os, sys, subprocess, random, multiprocessing
+import os, sys, subprocess, random, multiprocessing, concurrent.futures
+from tqdm.auto import tqdm
 
 """
 Polyalign
@@ -500,6 +501,65 @@ class Polyalign:
             "good pairs from multiple both aligned": 0,
             "no good pairs from multiple both aligned": 0,
         }
+
+        def listAnalysisWorker(chunk=None):
+            """
+            Run analysis_function on list of reads, using multiprocessing or multithreading
+            """
+            result = {
+                "index": chunk["index"],
+                "chunk": analyseReadPairing(self, chunk["list_1"], chunk["list_2"])
+            }
+            return result
+
+        def listAnalaysis(self, analysis_function, chunk_length=100000, multiprocess_mode="thread", workers=None):
+            """
+            Run analysis_function on list of reads, return processed list
+            """
+            # set number of workers
+            if workers is None:
+                workers = multiprocessing.cpu_count()
+            # setup multiprocessing mode
+            if multiprocess_mode is None:
+                # run in a single thread, still use the ThreadPoolExecutor since that's equivalent
+                print("-PA-", "Single thread")
+                Executor = concurrent.futures.ThreadPoolExecutor
+                workers = 1
+            elif multiprocess_mode == "process":
+                print("-PA-", "Parallel processes with", workers, "workers")
+                # setup executor as a process pool
+                Executor = concurrent.futures.ProcessPoolExecutor
+            elif multiprocess_mode == "thread":
+                # setup executor as a thread pool
+                print("-PA-", "Parallel threads with", workers, "workers")
+                Executor = concurrent.futures.ThreadPoolExecutor
+            else:
+                raise ValueError(f"Unknown multiprocess_mode '{multiprocess_mode}")
+            # fetch data for worklist
+            list_1 = []
+            list_2 = []
+            for i in range(chunk_length * workers):
+                next_read_1 = sam_1.nextRead()
+                next_read_2 = sam_2.nextRead()
+                if next_read_1 is not None and next_read_2 is not None:
+                    list_1.append(next_read_1)
+                    list_2.append(next_read_2)
+            list_1_chunks = [list_1[i:i + chunk_length] for i in range(0, len(list_1), chunk_length)]
+            list_2_chunks = [list_2[i:i + chunk_length] for i in range(0, len(list_2), chunk_length)]
+            list_chunks = []
+            for index in range(len(list_1_chunks)):
+                list_chunks.append({"index": index, "list_1": list_1_chunks[index][0], "list_2": list_2_chunks[index][0]})
+            # fire up executor
+            with Executor(workers) as executor:
+                futures = [executor.submit(listAnalysisWorker, chunk=chunk) for chunk in list_chunks]
+                results = [future.result() for future in tqdm(concurrent.futures.as_completed(futures), total=len(futures), smoothing=0)]
+            # sort and reconstruct results
+            results.sort(key=lambda x: x["index"])
+            result_1, result_2 = [], []
+            for result in results:
+                result_1 += result["chunk"][0]
+                result_2 += result["chunk"][1]
+            return [result_1, result_2]
         
         def printLine(line):
             if line is not None:
@@ -528,13 +588,11 @@ class Polyalign:
             program_line = ["@PG", "ID:PA", "PN:polyalign", "VN:0.0.0", "CL:"+" ".join(command)]
             return sam_1.readHeader() + [program_line], sam_2.readHeader() + [program_line]
         
-        def returnNextRead():
+        def analyseReadPairing(self, next_read_1, next_read_2):
             """
             Read input sams, check for read alignment and return correctly paired reads.
             Aims to copy Polypolish filtering: https://github.com/rrwick/Polypolish/blob/main/src/filter.rs alignment_pass_qc()
             """
-            next_read_1 = sam_1.nextRead()
-            next_read_2 = sam_2.nextRead()
             # no next read, return None
             if next_read_1 is None or next_read_2 is None:
                 return None, None
@@ -580,11 +638,6 @@ class Polyalign:
             stats["good pairs from multiple both aligned"] += 1
             return good_1, good_2
         
-        def nextOutput():
-            if header_output == False:
-                return returnHeader()
-            return returnNextRead()
-        
         print("-PA-", "Polyaligning in", self.output_type, "mode")
         retain_unmapped = False
         read_index = 0
@@ -614,7 +667,21 @@ class Polyalign:
         elif self.output_type == "paired":
             writeLines(file, header_1)
         # alignment and filtering
-        alignment_1, alignment_2 = returnNextRead()
+        results = listAnalaysis(self, analyseReadPairing)
+        while len(results) > 0:
+            print("-PA-", "Stats:", ", ".join([x[0]+": "+str(x[1]) for x in stats.items()]))
+            if self.output_type == "filtered":
+                writeLines(file_1, results[0])
+                writeLines(file_2, results[1])
+            elif self.output_type == "paired":
+                # TODO: Output is currently simple interleaving, but should set proper values...
+                # set [6] (rnext), [7] (pnext), sam flags [1]
+                writeLines(file, [x for a in zip(results[0], results[1]) for x in a])
+            results = listAnalaysis(self, analyseReadPairing)
+        """
+        next_read_1 = sam_1.nextRead()
+        next_read_2 = sam_2.nextRead()
+        alignment_1, alignment_2 = analyseReadPairing(self, next_read_1, next_read_2)
         while alignment_1 is not None and alignment_2 is not None:
             read_index += 1
             if read_index % 100000 == 0:
@@ -626,7 +693,10 @@ class Polyalign:
                 # TODO: Output is currently simple interleaving, but should set proper values...
                 # set [6] (rnext), [7] (pnext), sam flags [1]
                 writeLines(file, [x for a in zip(alignment_1, alignment_2) for x in a])
-            alignment_1, alignment_2 = returnNextRead()
+            next_read_1 = sam_1.nextRead()
+            next_read_2 = sam_2.nextRead()
+            alignment_1, alignment_2 = analyseReadPairing(self, next_read_1, next_read_2)
+        """
         # end output
         if self.output_type == "filtered":
             file_1.close()
