@@ -1,4 +1,4 @@
-import os, sys, subprocess, random, multiprocessing, concurrent.futures
+import os, sys, subprocess, random, multiprocessing, concurrent.futures, copy
 from tqdm.auto import tqdm
 
 """
@@ -206,6 +206,9 @@ class Alignment:
         self.optional = sam_line[11:]
         self.flag_indices = ["primary", "properly_aligned", "unmapped", "mate_unmapped", "reverse", "mate_reverse", "first", "second", "secondary", "qc_fail", "duplicate", "supplementary"]
     
+    def __repr__(self):
+        return self.__str__()
+
     def __str__(self):
         """
         Return sam line as a string
@@ -488,31 +491,93 @@ class Polyalign:
         os.remove("tmp1.fastq.tmp")
         os.remove("tmp2.fastq.tmp")
 
-    def polyalign(self):
+    def polyalign(self, retain_unmapped=False, mode="parallel"):
         """
         Do the polyalignment.
         Aligns left and right reads separately, parsing output for all possible correct pairings.
         """
-        header_output = False
-        stats = {
-            "both unaligned": 0,
-            "single unaligned": 0,
-            "unique both aligned": 0,
-            "good pairs from multiple both aligned": 0,
-            "no good pairs from multiple both aligned": 0,
-        }
+        def returnHeader():
+            """
+            Read input sams and return header lines
+            """
+            command = sys.argv.copy()
+            command[0] = os.path.basename(command[0])
+            program_line = Header(["@PG", "ID:polyalign", "PN:polyalign", "VN:0.0.0", "CL:"+" ".join(command)])
+            return sam_1.readHeader() + [program_line], sam_2.readHeader() + [program_line]
+        
+        def analyseReadPairing(self, next_read_1, next_read_2):
+            """
+            Read input sams, check for read alignment and return correctly paired reads.
+            Aims to copy Polypolish filtering: https://github.com/rrwick/Polypolish/blob/main/src/filter.rs alignment_pass_qc()
+            """
+            # no next read, return None
+            if next_read_1 is None or next_read_2 is None:
+                status = None
+                return None, None, status
+            # TODO: More consistent handling of read retention/discard, eg. just pop from list if not retained, and add support for setting ZP:Z:fail flag
+            # check for read name mismatch
+            if next_read_1[0].qname != next_read_2[0].qname:
+                print("-PA-", "Error: Read names do not match")
+            # check for no alignments
+            if self.isUnalignedPair(next_read_1, next_read_2):
+                # For pairs where both have zero alignments, retain sam lines, but no way to contribute to polishing.
+                status = "both unaligned"
+                if retain_unmapped:
+                    return next_read_1, next_read_2, status
+                return [], [], status
+            if self.isOneUnalignedPair(next_read_1, next_read_2):
+                # For pairs with exactly one alignment of each read, keep sam lines, ie. treat unique paired alignments as correct.
+                status = "single unaligned"
+                return next_read_1, next_read_2, status
+            if self.isSinglePair(next_read_1, next_read_2):
+                # For pairs where one has zero alignments, keep sam lines, ie. treat single alignments as correct.
+                status = "unique both aligned"
+                return next_read_1, next_read_2, status
+            # For pairs with multiple alignments, keep sam lines if it pairs (same ref seq, correct ori, good insert) with any of its pair's alignments.
+            good_1, good_2 = self.findGoodPairs(next_read_1, next_read_2)
+            if len(good_1) == 0 or len(good_2) == 0:
+                status = "no good pairs from multiple both aligned"
+                return [], [], status
+            # add sequence and quality to first good reads, replace with "*" for the rest
+            for index, good in enumerate(good_1):
+                if index == 0:
+                    good.seq = next_read_1[0].seq
+                    good.qual = next_read_1[0].qual
+                else:
+                    good.seq = "*"
+                    good.qual = "*"
+            for index, good in enumerate(good_2):
+                if index == 0:
+                    good.seq = next_read_2[0].seq
+                    good.qual = next_read_1[0].qual
+                else:
+                    good.seq = "*"
+                    good.qual = "*"
+            status = "good pairs from multiple both aligned"
+            return good_1, good_2, status
 
-        def listAnalysisWorker(chunk=None):
+        def batchChunkWorker(chunk=None):
             """
             Run analysis_function on list of reads, using multiprocessing or multithreading
             """
+            current_stats = {}
+            result_1, result_2 = [], []
+            for index in range(len(chunk["list_1"])):
+                curr_result_1, curr_result_2, status = analyseReadPairing(self, chunk["list_1"][index], chunk["list_2"][index])
+                if curr_result_1 is not None and curr_result_2 is not None and status is not None:
+                    result_1 += curr_result_1
+                    result_2 += curr_result_2
+                    if status not in current_stats:
+                        current_stats[status] = 0
+                    current_stats[status] += 1
             result = {
                 "index": chunk["index"],
-                "chunk": analyseReadPairing(self, chunk["list_1"], chunk["list_2"])
+                "chunk": (result_1, result_2),
+                "stats": current_stats
             }
             return result
 
-        def listAnalaysis(self, analysis_function, chunk_length=100000, multiprocess_mode="thread", workers=None):
+        def readBatchAnalysis(chunk_length=100000, multiprocess_mode="thread", workers=None):
             """
             Run analysis_function on list of reads, return processed list
             """
@@ -536,30 +601,33 @@ class Polyalign:
             else:
                 raise ValueError(f"Unknown multiprocess_mode '{multiprocess_mode}")
             # fetch data for worklist
-            list_1 = []
-            list_2 = []
-            for i in range(chunk_length * workers):
-                next_read_1 = sam_1.nextRead()
-                next_read_2 = sam_2.nextRead()
-                if next_read_1 is not None and next_read_2 is not None:
-                    list_1.append(next_read_1)
-                    list_2.append(next_read_2)
-            list_1_chunks = [list_1[i:i + chunk_length] for i in range(0, len(list_1), chunk_length)]
-            list_2_chunks = [list_2[i:i + chunk_length] for i in range(0, len(list_2), chunk_length)]
             list_chunks = []
-            for index in range(len(list_1_chunks)):
-                list_chunks.append({"index": index, "list_1": list_1_chunks[index][0], "list_2": list_2_chunks[index][0]})
+            for i in range(workers):
+                list_chunks.append({"index": i, "list_1": [], "list_2": []})
+                for j in range(chunk_length):
+                    next_read_1 = sam_1.nextRead()
+                    next_read_2 = sam_2.nextRead()
+                    if next_read_1 is not None and next_read_2 is not None:
+                        list_chunks[i]["list_1"].append(next_read_1)
+                        list_chunks[i]["list_2"].append(next_read_2)
+            print("-PA-", "Analysing read pairing,", len(list_chunks), "chunks of", len(list_chunks[0]["list_1"]), "read pairs")
             # fire up executor
             with Executor(workers) as executor:
-                futures = [executor.submit(listAnalysisWorker, chunk=chunk) for chunk in list_chunks]
-                results = [future.result() for future in tqdm(concurrent.futures.as_completed(futures), total=len(futures), smoothing=0)]
-            # sort and reconstruct results
+                futures = [executor.submit(batchChunkWorker, chunk=chunk) for chunk in list_chunks]
+                results = [future.result() for future in tqdm(concurrent.futures.as_completed(futures), total=len(futures), smoothing=0, disable=True)]
+            # reconstruct stats
+            for result in results:
+                for key in result["stats"]:
+                    if key not in self.stats:
+                        self.stats[key] = 0
+                    self.stats[key] += result["stats"][key]
+            # sort by chunk index and reconstruct results
             results.sort(key=lambda x: x["index"])
             result_1, result_2 = [], []
             for result in results:
                 result_1 += result["chunk"][0]
                 result_2 += result["chunk"][1]
-            return [result_1, result_2]
+            return (result_1, result_2)
         
         def printLine(line):
             if line is not None:
@@ -578,68 +646,16 @@ class Polyalign:
             if lines is not None:
                 for line in lines:
                     writeLine(file, line)
-                
-        def returnHeader():
-            """
-            Read input sams and return header lines
-            """
-            command = sys.argv.copy()
-            command[0] = os.path.basename(command[0])
-            program_line = ["@PG", "ID:PA", "PN:polyalign", "VN:0.0.0", "CL:"+" ".join(command)]
-            return sam_1.readHeader() + [program_line], sam_2.readHeader() + [program_line]
-        
-        def analyseReadPairing(self, next_read_1, next_read_2):
-            """
-            Read input sams, check for read alignment and return correctly paired reads.
-            Aims to copy Polypolish filtering: https://github.com/rrwick/Polypolish/blob/main/src/filter.rs alignment_pass_qc()
-            """
-            # no next read, return None
-            if next_read_1 is None or next_read_2 is None:
-                return None, None
-            # TODO: More consistent handling of read retention/discard, eg. just pop from list if not retained, and add support for setting ZP:Z:fail flag
-            # check for read name mismatch
-            #if Alignment(next_read_1[0]).qname != Alignment(next_read_2[0]).qname:
-            #    print("-PA-", "Error: Read names do not match")
-            # check for no alignments
-            if self.isUnalignedPair(next_read_1, next_read_2):
-                # For pairs where both have zero alignments, retain sam lines, but no way to contribute to polishing.
-                stats["both unaligned"] += 1
-                if retain_unmapped:
-                    return next_read_1, next_read_2
-                return [], []
-            if self.isOneUnalignedPair(next_read_1, next_read_2):
-                # For pairs with exactly one alignment of each read, keep sam lines, ie. treat unique paired alignments as correct.
-                stats["single unaligned"] += 1
-                return next_read_1, next_read_2
-            if self.isSinglePair(next_read_1, next_read_2):
-                # For pairs where one has zero alignments, keep sam lines, ie. treat single alignments as correct.
-                stats["unique both aligned"] += 1
-                return next_read_1, next_read_2
-            # For pairs with multiple alignments, keep sam lines if it pairs (same ref seq, correct ori, good insert) with any of its pair's alignments.
-            good_1, good_2 = self.findGoodPairs(next_read_1, next_read_2)
-            if len(good_1) == 0 or len(good_2) == 0:
-                stats["no good pairs from multiple both aligned"] += 1
-                return [], []
-            # add sequence and quality to first good reads, replace with "*" for the rest
-            for index, good in enumerate(good_1):
-                if index == 0:
-                    good.seq = next_read_1[0].seq
-                    good.qual = next_read_1[0].qual
-                else:
-                    good.seq = "*"
-                    good.qual = "*"
-            for index, good in enumerate(good_2):
-                if index == 0:
-                    good.seq = next_read_2[0].seq
-                    good.qual = next_read_1[0].qual
-                else:
-                    good.seq = "*"
-                    good.qual = "*"
-            stats["good pairs from multiple both aligned"] += 1
-            return good_1, good_2
-        
+
         print("-PA-", "Polyaligning in", self.output_type, "mode")
-        retain_unmapped = False
+        # set mode
+        mode = "parallel"
+        if mode is None:
+            mode = "parallel"
+        if mode not in ["serial", "parallel"]:
+            raise ValueError(f"Unknown mode '{mode}'")
+        # initialise stats
+        self.stats = {}
         read_index = 0
         # open output
         if self.output_type == "filtered":
@@ -667,37 +683,44 @@ class Polyalign:
         elif self.output_type == "paired":
             writeLines(file, header_1)
         # alignment and filtering
-        results = listAnalaysis(self, analyseReadPairing)
-        while len(results) > 0:
-            print("-PA-", "Stats:", ", ".join([x[0]+": "+str(x[1]) for x in stats.items()]))
-            if self.output_type == "filtered":
-                writeLines(file_1, results[0])
-                writeLines(file_2, results[1])
-            elif self.output_type == "paired":
-                # TODO: Output is currently simple interleaving, but should set proper values...
-                # set [6] (rnext), [7] (pnext), sam flags [1]
-                writeLines(file, [x for a in zip(results[0], results[1]) for x in a])
-            results = listAnalaysis(self, analyseReadPairing)
-        """
-        next_read_1 = sam_1.nextRead()
-        next_read_2 = sam_2.nextRead()
-        alignment_1, alignment_2 = analyseReadPairing(self, next_read_1, next_read_2)
-        while alignment_1 is not None and alignment_2 is not None:
-            read_index += 1
-            if read_index % 100000 == 0:
-                print("-PA-", "Stats:", ", ".join([x[0]+": "+str(x[1]) for x in stats.items()]))
-            if self.output_type == "filtered":
-                writeLines(file_1, alignment_1)
-                writeLines(file_2, alignment_2)
-            elif self.output_type == "paired":
-                # TODO: Output is currently simple interleaving, but should set proper values...
-                # set [6] (rnext), [7] (pnext), sam flags [1]
-                writeLines(file, [x for a in zip(alignment_1, alignment_2) for x in a])
+        if mode == "parallel":
+            results = readBatchAnalysis()
+            while len(results[0]) > 0 and len(results[1]) > 0:
+                print("-PA-", "Stats:", ", ".join([x[0]+": "+str(x[1]) for x in self.stats.items()]))
+                if self.output_type == "filtered":
+                    writeLines(file_1, results[0])
+                    writeLines(file_2, results[1])
+                elif self.output_type == "paired":
+                    # TODO: Output is currently simple interleaving, but should set proper values...
+                    # set [6] (rnext), [7] (pnext), sam flags [1]
+                    writeLines(file, [x for a in zip(results[0], results[1]) for x in a])
+                results = readBatchAnalysis()
+        elif mode == "serial":
             next_read_1 = sam_1.nextRead()
             next_read_2 = sam_2.nextRead()
-            alignment_1, alignment_2 = analyseReadPairing(self, next_read_1, next_read_2)
-        """
+            alignment_1, alignment_2, status = analyseReadPairing(self, next_read_1, next_read_2)
+            while alignment_1 is not None and alignment_2 is not None:
+                read_index += 1
+                if status is not None:
+                    if status not in self.stats:
+                        self.stats[status] = 0
+                    self.stats[status] += 1
+                if read_index % 100000 == 0:
+                    print("-PA-", "Stats:", ", ".join([x[0]+": "+str(x[1]) for x in self.stats.items()]))
+                if self.output_type == "filtered":
+                    writeLines(file_1, alignment_1)
+                    writeLines(file_2, alignment_2)
+                elif self.output_type == "paired":
+                    # TODO: Output is currently simple interleaving, but should set proper values...
+                    # set [6] (rnext), [7] (pnext), sam flags [1]
+                    writeLines(file, [x for a in zip(alignment_1, alignment_2) for x in a])
+                next_read_1 = sam_1.nextRead()
+                next_read_2 = sam_2.nextRead()
+                alignment_1, alignment_2, status = analyseReadPairing(self, next_read_1, next_read_2)
         # end output
+        print("-PA-", "End of bwa mem output reached")
+        print("-PA-", "Final stats:", ", ".join([x[0]+": "+str(x[1]) for x in self.stats.items()]))
+        print("-PA-", "Polyaligning complete")
         if self.output_type == "filtered":
             file_1.close()
             file_2.close()
