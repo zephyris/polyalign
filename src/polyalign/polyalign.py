@@ -1,4 +1,4 @@
-import os, sys, subprocess, multiprocessing, concurrent.futures, time
+import os, sys, subprocess, multiprocessing, concurrent.futures, time, random
 import functools
 from tqdm.auto import tqdm
 
@@ -22,7 +22,7 @@ class BwaMem:
             raise ValueError("Program must be one of: "+", ".join(programs))
         self.cpus = cpus
         if self.cpus is None:
-            self.cpus = multiprocessing.cpu_count() / 2
+            self.cpus = multiprocessing.cpu_count() // 2
         self.cpus = str(self.cpus)
         self.index_suffices = [".amb", ".ann", ".bwt", ".pac", ".sa"]
         if do_indexing:
@@ -355,6 +355,12 @@ class AlignmentPair:
         if not self.sameReference():
             return None
         return max(self.read_1.rightmostPosition(), self.read_2.rightmostPosition()) - min(self.read_1.leftmostPosition(), self.read_2.leftmostPosition())
+    
+    def readLength(self):
+        """
+        List of both read lengths
+        """
+        return [len(self.read_1.seq), len(self.read_2.seq)]
 
     def orientation(self):
         """
@@ -402,10 +408,7 @@ class Polyalign:
         self.reads_2_path = reads_2_path
         self.output_path = output_path
         self.output_basename = output_basename
-        output_types = ["filtered", "paired"]
         self.output_type = output_type
-        if self.output_type not in output_types:
-            raise ValueError("Output type must be one of: "+", ".join(output_types))
         # set necessary bwa options, -a and -Y flags
         bwa_options["a"] = None
         bwa_options["Y"] = None
@@ -456,17 +459,12 @@ class Polyalign:
         Find all good pairs of read_1 and read_2 alignments, pairs which align to the same reference, with the correct insert size, in the correct orientation
         """
         good_1, good_2 = [False] * len(read_1), [False] * len(read_2)
-        paired_1, paired_2 = [], []
         for index_1, alignment_1 in enumerate(read_1):
             for index_2, alignment_2 in enumerate(read_2):
                 if self.isGoodSinglePair([alignment_1], [alignment_2]):
                     good_1[index_1] = True
                     good_2[index_2] = True
-                    paired_1.append(alignment_1), paired_2.append(alignment_2)
-        if self.output_type == "filtered":
-            return [read_1[index] for index, value in enumerate(good_1) if value], [read_2[index] for index, value in enumerate(good_2) if value]
-        if self.output_type == "paired":
-            return paired_1, paired_2
+        return [read_1[index] for index, value in enumerate(good_1) if value], [read_2[index] for index, value in enumerate(good_2) if value]
     
     def estimateInsertSizeRange(self, read_sample = 100000, insert_size_percentile = 0.01):
         """
@@ -488,6 +486,7 @@ class Polyalign:
         # output stats
         insert_size = []
         orientation = {"fr": 0, "ff": 0, "rr": 0, "rf": 0}
+        read_length = []
         # sample reads
         print("[PA::EISR]", "Sampling "+str(read_sample)+" reads")
         sampleReads(self.reads_1_path, "tmp1.fastq.tmp", read_sample)
@@ -512,12 +511,17 @@ class Polyalign:
                 if read_pair.sameReference():
                     insert_size.append(read_pair.insertSize())
                     orientation[read_pair.orientation()] += 1
+                    read_length += read_pair.readLength()
             next_read_1 = sam_1.nextRead()
             next_read_2 = sam_2.nextRead()
         # analyse insert_size
         insert_size.sort()
         insert_lower = insert_size[int(len(insert_size) * insert_size_percentile)]
         insert_upper = insert_size[int(len(insert_size) * (1 - insert_size_percentile))]
+        # clamp minimum insert_size to 2x read length
+        read_length = sum(read_length) // len(read_length)
+        if insert_lower < read_length * 2:
+            insert_lower = read_length * 2
         # print result
         print("[PA::EISR]", "Result:")
         print("[PA::EISR]", "Insert size "+str(insert_size_percentile * 100)+"% and "+str(100 - insert_size_percentile * 100)+"% percentile:", insert_lower, insert_upper)
@@ -592,8 +596,8 @@ class Polyalign:
         for index in range(len(chunk["list_1"])):
             curr_result_1, curr_result_2, status = self.analyseReadPairing(chunk["list_1"][index], chunk["list_2"][index])
             if curr_result_1 is not None and curr_result_2 is not None and status is not None:
-                result_1 += curr_result_1
-                result_2 += curr_result_2
+                result_1.append(curr_result_1)
+                result_2.append(curr_result_2)
                 if status not in current_stats:
                     current_stats[status] = 0
                 current_stats[status] += 1
@@ -674,24 +678,6 @@ class Polyalign:
             time_taken = time.time() - start_time
             print("[PA::RBA]", sum([len(x["list_1"]) for x in list_chunks]), "reads analysed in", round(time_taken * workers, 3), "CPU sec,", round(time_taken, 3), "real sec")
             return (result_1, result_2)
-        
-        def printLine(line):
-            if line is not None:
-                print(str(line))
-        
-        def printLines(lines):
-            if lines is not None:
-                for line in lines:
-                    printLine(line)
-        
-        def writeLine(file, line):
-            if line is not None:
-                file.write(str(line)+"\n")
-        
-        def writeLines(file, lines):
-            if lines is not None:
-                for line in lines:
-                    writeLine(file, line)
 
         print("[PA::PA]", "Polyaligning in", self.output_type, "mode")
         # set mode
@@ -705,17 +691,7 @@ class Polyalign:
         self.stats = {}
         read_index = 0
         # open output
-        if self.output_type == "filtered":
-            file_1 = open(os.path.join(self.output_path, self.output_basename+"_1.sam"), "w")
-            file_2 = open(os.path.join(self.output_path, self.output_basename+"_2.sam"), "w")
-            print("[PA::PA]", "Output files:", self.output_basename+"_1.sam", self.output_basename+"_2.sam")
-        elif self.output_type == "paired":
-            if self.output_basename == "-":
-                file = sys.stdout
-                print("[PA::PA]", "Outputting to stdout")
-            else:
-                file = open(os.path.join(self.output_path, self.output_basename+".sam"), "w")
-                print("[PA::PA]", "Output file:", self.output_basename+".sam")
+        output = Output(self.output_basename, self.output_type, self.output_path)
         # start alignment
         sam_1 = self.bwa_mem.mem(self.reads_1_path)
         sam_2 = self.bwa_mem.mem(self.reads_2_path)
@@ -724,23 +700,13 @@ class Polyalign:
         sam_2.readLine()
         # header
         header_1, header_2 = returnHeader()
-        if self.output_type == "filtered":
-            writeLines(file_1, header_1)
-            writeLines(file_2, header_2)
-        elif self.output_type == "paired":
-            writeLines(file, header_1)
+        output.writeHeader(header_1, header_1)
         # alignment and filtering
         if mode == "parallel":
             results = readBatchAnalysis()
             while len(results[0]) > 0 and len(results[1]) > 0:
                 print("[PA::PA]", "Stats:", ", ".join([x[0]+": "+str(x[1]) for x in self.stats.items()]))
-                if self.output_type == "filtered":
-                    writeLines(file_1, results[0])
-                    writeLines(file_2, results[1])
-                elif self.output_type == "paired":
-                    # TODO: Output is currently simple interleaving, but should set proper values...
-                    # set [6] (rnext), [7] (pnext), sam flags [1]
-                    writeLines(file, [x for a in zip(results[0], results[1]) for x in a])
+                output.writeAlignment(results[0], results[1])
                 results = readBatchAnalysis()
         elif mode == "serial":
             next_read_1 = sam_1.nextRead()
@@ -754,23 +720,185 @@ class Polyalign:
                     self.stats[status] += 1
                 if read_index % 100000 == 0:
                     print("[PA::PA]", "Stats:", ", ".join([x[0]+": "+str(x[1]) for x in self.stats.items()]))
-                if self.output_type == "filtered":
-                    writeLines(file_1, alignment_1)
-                    writeLines(file_2, alignment_2)
-                elif self.output_type == "paired":
-                    # TODO: Output is currently simple interleaving, but should set proper values...
-                    # set [6] (rnext), [7] (pnext), sam flags [1]
-                    writeLines(file, [x for a in zip(alignment_1, alignment_2) for x in a])
-                next_read_1 = sam_1.nextRead()
-                next_read_2 = sam_2.nextRead()
+                output.writeAlignment([alignment_1], [alignment_2])
                 alignment_1, alignment_2, status = self.analyseReadPairing(next_read_1, next_read_2)
         # end output
+        output.closeOutput()
         print("[PA::PA]", "End of bwa mem output reached")
         print("[PA::PA]", "Final stats:", ", ".join([x[0]+": "+str(x[1]) for x in self.stats.items()]))
         print("[PA::PA]", "Polyaligning complete")
-        if self.output_type == "filtered":
-            file_1.close()
-            file_2.close()
-        elif self.output_type == "paired":
-            if self.output_basename != "-":
-                file.close()
+
+class Output:
+    def __init__(self, base_name, output_mode, base_path):
+        self.base_path = base_path
+        self.base_name = base_name
+        self.output_mode = output_mode
+        self.soft_file_limit = None
+        output_modes = ["filtered", "paired", "splitfiltered"]
+        if self.output_mode not in output_modes:
+            raise ValueError("Output mode must be one of:", ", ".join(output_modes))
+        if self.base_name == "-" and output_mode != "filtered":
+            raise ValueError("Output mode except for 'paired' requires a base path")
+        self.output_paths = self.setupOutput()
+        print("[PA::OP]", "Output mode:", self.output_mode, "Base name:", self.base_name, "Base path:", self.base_path)
+
+    def setupOutput(self):
+        if self.base_name == "-":
+            print("[PA::OP]", "Outputting to stdout")
+            return [sys.stdout]
+        if self.output_mode == "paired":
+            print("[PA::OP]", "Output file:", self.base_name+".sam")
+            return [open(os.path.join(self.base_path, self.base_name + ".sam"), "w")]
+        if self.output_mode == "filtered":
+            print("[PA::OP]", "Output files:", self.base_name+"_1.sam", self.base_name+"_2.sam")
+            return [open(os.path.join(self.base_path, self.base_name + "_1.sam"), "w"), open(os.path.join(self.base_path, self.base_name + "_2.sam"), "w")]
+        if self.output_mode == "splitfiltered":
+            print("[PA::OP]", "Output directories:", self.base_name+"_1", self.base_name+"_2")
+            self.checkOutputDir(os.path.join(self.base_path, self.base_name+"_1"))
+            self.checkOutputDir(os.path.join(self.base_path, self.base_name+"_2"))
+            self.soft_file_limit = self.getOpenFileLimit()
+            self.open_files = [{}, {}] # open file dicts, index 0 for read 1, 1 for read 2
+            self.line_buffers = [{}, {}] # line buffers for each reference sequence, index 0 for read 1, 1 for read 2
+            self.buffer_lines = 1000
+            return [os.path.join(self.base_path, self.base_name+"_1"), os.path.join(self.base_path, self.base_name+"_2")]
+
+    def getOpenFileLimit(self):
+        """
+        Get the maximum number of open files
+        """
+        softfilelimit = 1024
+        import importlib.util
+        if importlib.util.find_spec("resource") is not None:
+            # if resource, a linux-only module, is available
+            import resource
+            softfilelimit, hardfilelimit = resource.getrlimit(resource.RLIMIT_NOFILE)
+        print("[PA::OP]", "Soft file limit:", softfilelimit)
+        return softfilelimit - 10
+
+    def checkOutputDir(self, path):
+        """
+        Make the output path or check it is empty
+        """
+        # check the output directory and make if needed
+        if os.path.exists(path):
+            if len(os.listdir(path)) > 0:
+            # directory must be empty - this script will append to existing files on file name collision
+                raise ValueError("Output directory must be empty")
+        else:
+            os.mkdir(path)
+        
+    def writeLine(self, file, line):
+        if line is not None:
+            if self.base_path == "-":
+                print(str(line))
+            else:
+                file.write(str(line)+"\n")
+    
+    def writeLines(self, file, lines):
+        if lines is not None:
+            for line in lines:
+                self.writeLine(file, line)
+    
+    def writeHeader(self, header_1, header_2):
+        print("[PA::OP]", "Writing headers")
+        if self.output_mode == "filtered":
+            # two output files, so write header to both
+            self.writeLines(self.output_paths[0], header_1)
+            self.writeLines(self.output_paths[1], header_2)
+        if self.output_mode == "paired":
+            # single output file, so single header
+            self.writeLines(self.output_paths[0], header_1)
+        if self.output_mode == "splitfiltered":
+            # add headers to line buffers for each reference sequence
+            headers = [header_1, header_2]
+            for h in range(len(headers)):
+                for line in headers[h]:
+                    if line.line[0] == "@SQ":
+                        # for sequence lines, assumes they come first
+                        for entry in line.line[1:]:
+                            if entry[0:2] == "SN":
+                                referencename = entry[3:]
+                        # setup output buffer for each reference sequence, with @SQ specific to output file
+                        self.line_buffers[h][referencename] = []
+                        self.line_buffers[h][referencename].append(line)                
+                    else:
+                        # all other header lines to all files
+                        for reference in self.line_buffers[h]:
+                            self.line_buffers[h][reference].append(line)
+
+    def writeAlignment(self, lines_1, lines_2):
+        if self.output_mode == "filtered":
+            for l in range(len(lines_1)):
+                self.writeLines(self.output_paths[0], lines_1[l])
+                self.writeLines(self.output_paths[1], lines_2[l])
+        if self.output_mode == "paired":
+            for l in range(len(lines_1)):
+                # for each read pair
+                if len(lines_1[l]) > 0 and len(lines_2[l]) > 0:
+                    # pick a random pair if multiple alignments, ensuring sequence data is included
+                    if len(lines_1[l]) > 1 or len(lines_2[l]) > 1:
+                        out_1, out_2 = random.choice(lines_1[l]), random.choice(lines_2[l])
+                        out_1.seq, out_1.qual = lines_1[l][0].seq, lines_1[l][0].qual
+                        out_2.seq, out_2.qual = lines_2[l][0].seq, lines_2[l][0].qual
+                        lines_1[l], lines_2[l] = [out_1], [out_2]
+                    # set pairing information
+                    lines_1[l][0].rnext, lines_2[l][0].rnext = lines_2[l][0].rname, lines_1[l][0].rname
+                    lines_1[l][0].pnext, lines_2[l][0].pnext = lines_2[l][0].pos, lines_1[l][0].pos  
+                    self.writeLines(self.output_paths[0], [lines_1[l][0], lines_2[l][0]])
+        if self.output_mode == "splitfiltered":
+            # append to appropriate buffer, only when rname is in buffer keys to exclude unmapped reads
+            lines = [lines_1, lines_2]
+            for dir in range(len(lines)):
+                # for left and right read
+                for l in range(len(lines[dir])):
+                    # for each read
+                    out_rnames = [] # each reference aligned to, so far
+                    for a in range(len(lines[dir][l])):
+                        # for each alignment
+                        rname = lines[dir][l][a].rname
+                        if rname in self.line_buffers[dir]: # only write to buffer if reference is in buffer, not unaligned sequcence
+                            if rname not in out_rnames:
+                                # first alignment to this reference, so infill sequence data
+                                out_rnames.append(rname)
+                                lines[dir][l][a].seq, lines[dir][l][a].qual = lines[dir][l][0].seq, lines[dir][l][0].qual
+                            # append to buffer
+                            self.line_buffers[dir][rname].append(lines[dir][l][a])
+                            # write buffer to file if too many lines buffered
+                            if len(self.line_buffers[dir][rname]) > self.buffer_lines:
+                                # check if too many files are open, and close first opened one if necessary
+                                if len(self.open_files[dir]) >= self.soft_file_limit / 2:
+                                    first_file = next(iter(self.open_files[dir]))
+                                    self.open_files[dir][first_file].close()
+                                    self.open_files[dir].pop(first_file)
+                                # write buffer to file
+                                if rname not in self.open_files[dir]:
+                                    self.open_files[dir][rname] = open(os.path.join(self.output_paths[dir], rname+"_"+str(dir+1)+".sam"), "w")
+                                self.writeLines(self.open_files[dir][rname], self.line_buffers[dir][rname])
+                                self.line_buffers[dir][rname] = []
+
+    def closeOutput(self):
+        if self.base_path == "-":
+            return
+        if self.output_mode == "filtered":
+            self.outpaths[0].close()
+            self.outpaths[1].close()
+        if self.output_mode == "paired":
+            self.outpaths[0].close()
+        if self.output_mode == "splitfiltered":
+            # write buffers for open files
+            for l in range(len(self.line_buffers)):
+                for file in self.line_buffers[l]:
+                    if self.open_files[l][file] is not None:
+                        self.writeLines(self.open_files[l][file], self.line_buffers[l][file])
+                        self.line_buffers[l][file] = []
+                        self.open_files[l][file].close()
+            # write remaining buffers
+            for l in range(len(self.line_buffers)):
+                for reference in self.line_buffers[l]:
+                    if len(self.line_buffers[l][reference]) > 0:
+                        if self.open_files[l][reference] is None:
+                            self.open_files[l][reference] = open(os.path.join(self.base_path, reference+"_"+str(l+1)+".sam"), "w")
+                        self.writeLines(self.open_files[l][reference], self.line_buffers[l][reference])
+                        self.line_buffers[l][reference] = []
+                        self.open_files[l][reference].close()
+
