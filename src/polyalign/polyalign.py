@@ -402,7 +402,7 @@ class Polyalign:
     Object to handle separate exhaustive bwa alignments of left and right reads.
     Estimates insert size and returns sam of only accepted best pairings.
     """
-    def __init__(self, subject_path, reads_1_path, reads_2_path, output_path=".", output_basename="polyalign", output_type="filtered", read_orientation=None, insert_size_range=None, bwa_options={}, do_bwa_indexing=True):
+    def __init__(self, subject_path, reads_1_path, reads_2_path, output_path=".", output_basename="polyalign", output_type="filtered", retain_unmapped=None, read_orientation=None, insert_size_range=None, bwa_options={}, do_bwa_indexing=True):
         self.subject_path = subject_path
         self.reads_1_path = reads_1_path
         self.reads_2_path = reads_2_path
@@ -419,6 +419,11 @@ class Polyalign:
         self.insert_size_range = insert_size_range
         if self.read_orientation is None or self.insert_size_range is None:
             self.estimateInsertSizeRange()
+        self.retain_unmapped = retain_unmapped
+        if self.retain_unmapped is None and output_type == "paired":
+            self.retain_unmapped = False
+        else:
+            self.retain_unmapped = True
 
     def isSinglePair(self, read_1, read_2):
         """
@@ -544,7 +549,6 @@ class Polyalign:
         if next_read_1 is None or next_read_2 is None:
             status = None
             return None, None, status
-        retain_unmapped = False
         # TODO: More consistent handling of read retention/discard, eg. just pop from list if not retained, and add support for setting ZP:Z:fail flag
         # check for read name mismatch
         if next_read_1[0].qname != next_read_2[0].qname:
@@ -553,7 +557,9 @@ class Polyalign:
         if self.isUnalignedPair(next_read_1, next_read_2):
             # For pairs where both have zero alignments, retain sam lines, but no way to contribute to polishing.
             status = "both unaligned"
-            if retain_unmapped:
+            next_read_1[0].setOptional("ZP", "fail", "Z")
+            next_read_2[0].setOptional("ZP", "fail", "Z")
+            if self.retain_unmapped:
                 return next_read_1, next_read_2, status
             return [], [], status
         if self.isOneUnalignedPair(next_read_1, next_read_2):
@@ -566,26 +572,41 @@ class Polyalign:
             return next_read_1, next_read_2, status
         # For pairs with multiple alignments, keep sam lines if it pairs (same ref seq, correct ori, good insert) with any of its pair's alignments.
         good_1, good_2 = self.findGoodPairs(next_read_1, next_read_2)
-        if len(good_1) == 0 or len(good_2) == 0:
-            status = "no good pairs from multiple both aligned"
-            return [], [], status
-        # add sequence and quality to first good reads, replace with "*" for the rest
-        for index, good in enumerate(good_1):
-            if index == 0:
-                good.seq = next_read_1[0].seq
-                good.qual = next_read_1[0].qual
+        if self.retain_unmapped:
+            # Keep all read alignments, but mark as failed
+            for read_1 in next_read_1:
+                if read_1 not in good_1:
+                    read_1.setOptional("ZP", "fail", "Z")
+            for read_2 in next_read_2:
+                if read_2 not in good_2:
+                    read_2.setOptional("ZP", "fail", "Z")
+            if len(good_1) == 0 or len(good_2) == 0:
+                status = "no good pairs from multiple both aligned"
             else:
-                good.seq = "*"
-                good.qual = "*"
-        for index, good in enumerate(good_2):
-            if index == 0:
-                good.seq = next_read_2[0].seq
-                good.qual = next_read_1[0].qual
-            else:
-                good.seq = "*"
-                good.qual = "*"
-        status = "good pairs from multiple both aligned"
-        return good_1, good_2, status
+                status = "good pairs from multiple both aligned"
+            return next_read_1, next_read_2, status
+        else:
+            # keep only good read alignments
+            if len(good_1) == 0 or len(good_2) == 0:
+                status = "no good pairs from multiple both aligned"
+                return [], [], status
+            for index, good in enumerate(good_1):
+                # add sequence and quality to first good reads, replace with "*" for the rest
+                if index == 0:
+                    good.seq = next_read_1[0].seq
+                    good.qual = next_read_1[0].qual
+                else:
+                    good.seq = "*"
+                    good.qual = "*"
+            for index, good in enumerate(good_2):
+                if index == 0:
+                    good.seq = next_read_2[0].seq
+                    good.qual = next_read_1[0].qual
+                else:
+                    good.seq = "*"
+                    good.qual = "*"
+            status = "good pairs from multiple both aligned"
+            return good_1, good_2, status
 
     def batchChunkWorker(self, chunk=None):
         """
@@ -608,7 +629,7 @@ class Polyalign:
         }
         return result
 
-    def polyalign(self, retain_unmapped=False, mode="parallel"):
+    def polyalign(self, mode="parallel"):
         """
         Do the polyalignment.
         Aligns left and right reads separately, parsing output for all possible correct pairings.
