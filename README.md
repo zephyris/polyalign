@@ -40,22 +40,23 @@ pip uninstall polyalign
 ## Standalone usage
 
 ``` shell
-python3 -m polyalign [filteedr|paired] <reference.fasta> <reads_1.fastq> <reads_2.fastq> <output_basename>
+python3 -m polyalign [filtered|filteredsplit|paired] <reference.fasta> <reads_1.fastq> <reads_2.fastq> <output_basename>
 ```
 
 Reads have to be `fastq` format, `fasta` is not supported. In `filtered` mode, the output is two `sam` files, `<output_basename>_1.sam` and `<output_basename>_2.sam`.
+In `filteredsplit` mode, the output is two `sam` files per sequence in the input `<reference.fasta>` file, output to the directories `<output_basename>_1` and `<output_basename>_2`.
 In `paired` mode, the output is one `sam` file, `<output_basename>.sam`. In `paired` mode, `<output_basename>` of `-` will give `sam` output on `stdout`.
 
 `polyalign` first samples a subset of reads from the start of both `fastq` files to identify orientation of read pairs and typical insert size from reads pairs aligned as a unique pair.
 Next, it aligns the entire set of reads. Read pairs where one is not aligned and one is aligned to a single place are retained. Read pairs where both are aligned to a single place are retained.
-Read pairs which aligned to multiple places are retained, if a pair can be formed which gives typical insert size and correct orientation.
+Reads alignments to multiple places are retained, if a pair can be formed which gives typical insert size and correct orientation. For `filtered` and `filteredsplit` outputs, all such alignments are retained. For `paired`, one good pairing is randomly selected as the output`.
 
-In `filtered` mode, this behaviour broadly matches matches (Polypolish)[https://github.com/rrwick/Polypolish] `polypolish filter`, and can be used for subsequent `polypolish polish`. There are a few exceptions:
-Reads which are not retained are discarded from the SAM instead of marked with the `ZP:Z:fail` flag, and read pairs where both are not aligned are discarded.
+In `filtered` mode, this behaviour broadly matches matches [Polypolish](https://github.com/rrwick/Polypolish) `polypolish filter`, and can be used for subsequent `polypolish polish`.
+In `filteredsplit` mode, each individual `sam` file can be used for `polypolish polish` agains the appropriate reference sequence.
 
 In `paired` mode, this outputs a `sam` file similar to normal `bwa mem` paired alignments, and can be used for general subsequent analyses.
 
 ## Python module usage
 
-You can use `polyalign` in your Python scripts - however it is subject to change. The `Polyalign` class carries out high-level operation.
+You can use `polyalign` in your Python scripts - however it is subject to change. The `Polyalign` class carries out high-level operation, ouputting using the `Output` class.
 `BwaMem` is to run `bwa mem` alignments. `Alignment` and `AlignmentClass` are used to parse alignments and alignment pairs.
