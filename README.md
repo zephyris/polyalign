@@ -60,3 +60,9 @@ In `paired` mode, this outputs a `sam` file similar to normal `bwa mem` paired a
 
 You can use `polyalign` in your Python scripts - however it is subject to change. The `Polyalign` class carries out high-level operation, ouputting using the `Output` class.
 `BwaMem` is to run `bwa mem` alignments. `Alignment` and `AlignmentClass` are used to parse alignments and alignment pairs.
+
+## History and citing
+
+This module was written to optimise polishing of small eukaryotic genomes assembled from noisy Nanopore data. The Polypolish strategy for polishing repetitive sequences is very promising, but designed for small (bacterial) genomes. Polyalign allows application of the same method to larger, eg. eukarotic genomes, without requiring enormous computational resources.
+
+I haven't ultimately used it for a published genome assembly, but I've made it available in case it is useful. Please send me a message and cite this Github repository if you are publishing anything using this as a tool. Please also cite Polypolish, as this is _very_ closely modeled on that work.
