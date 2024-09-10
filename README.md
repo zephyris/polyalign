@@ -2,6 +2,10 @@
 
 A simple Python and BWA MEM-based aligner with improved read pairing.
 
+`polyalign` aims to generate `sam`-format alignments which can be used for high accuracy polishing of repetitive sequences.
+
+It is heavily inspired by `polypolish align` from [Polypolish](https://github.com/rrwick/Polypolish), but aims to reduce memory usages. This allows its use on eukaryote genomes.
+
 ## Installation
 
 ### Dependencies
@@ -49,10 +53,11 @@ In `paired` mode, the output is one `sam` file, `<output_basename>.sam`. In `pai
 
 `polyalign` first samples a subset of reads from the start of both `fastq` files to identify orientation of read pairs and typical insert size from reads pairs aligned as a unique pair.
 Next, it aligns the entire set of reads. Read pairs where one is not aligned and one is aligned to a single place are retained. Read pairs where both are aligned to a single place are retained.
-Reads alignments to multiple places are retained, if a pair can be formed which gives typical insert size and correct orientation. For `filtered` and `filteredsplit` outputs, all such alignments are retained. For `paired`, one good pairing is randomly selected as the output`.
+Reads alignments to multiple places are retained, if a pair can be formed which gives typical insert size and correct orientation. For `filtered` and `filteredsplit` outputs, all such alignments are retained. For `paired`, one good pairing is randomly selected as the output.
 
-In `filtered` mode, this behaviour broadly matches matches [Polypolish](https://github.com/rrwick/Polypolish) `polypolish filter`, and can be used for subsequent `polypolish polish`.
-In `filteredsplit` mode, each individual `sam` file can be used for `polypolish polish` agains the appropriate reference sequence.
+In `filtered` mode, this behaviour broadly matches matches [Polypolish](https://github.com/rrwick/Polypolish) `polypolish filter`. The resulting output can be used for subsequent polishing using `polypolish polish`.
+
+In `filteredsplit` mode, each individual `sam` file can be used for `polypolish polish` against the appropriate reference sequence.
 
 In `paired` mode, this outputs a `sam` file similar to normal `bwa mem` paired alignments, and can be used for general subsequent analyses.
 
