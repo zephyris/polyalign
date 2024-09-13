@@ -901,10 +901,10 @@ class Output:
         if self.base_path == "-":
             return
         if self.output_mode == "filtered":
-            self.outpaths[0].close()
-            self.outpaths[1].close()
+            self.output_paths[0].close()
+            self.output_paths[1].close()
         if self.output_mode == "paired":
-            self.outpaths[0].close()
+            self.output_paths[0].close()
         if self.output_mode == "splitfiltered":
             # write buffers for open files
             for l in range(len(self.line_buffers)):
