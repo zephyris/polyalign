@@ -5,7 +5,9 @@ __pycache__/
 
 # fasta, fastq and bwa indexes
 *.fasta
+*.fa
 *.fastq
+*.fq
 *.amb
 *.ann
 *.bwt

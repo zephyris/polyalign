@@ -44,20 +44,17 @@ if [ ! -f $illumina1 ]; then
   fetchsra SRR19895146
 fi
 
-if [ ! -f genome.fasta ]; then
-  curl -L https://tritrypdb.org/common/downloads/release-68/LmexicanaMHOMGT2001U1103/fasta/data/TriTrypDB-68_LmexicanaMHOMGT2001U1103_Genome.fasta > genome.fasta
+genome=Lmexicana.fasta
+if [ ! -f $genome ]; then
+  curl -L https://tritrypdb.org/common/downloads/release-68/LmexicanaMHOMGT2001U1103/fasta/data/TriTrypDB-68_LmexicanaMHOMGT2001U1103_Genome.fasta > $genome
 fi
 
 # do the tests
 
 # with polypolish
-# polyalign in filtered mode
-python3 -m polyalign filtered genome.fasta $illumina1 $illumina2 polyalign-split
-polypolish polish genome.fasta polyalign-split_1.sam polyalign-split_2.sam > genome-polyalign-split.fasta
-
 # polyalign in splitfiltered mode
-python3 -m polyalign splitfiltered genome.fasta $illumina1 $illumina2 polyalign-splitfiltered
-python3 -m polyalign splitfasta genome.fasta polyalign-splitfiltered
+python3 -m polyalign splitfiltered $genome $illumina1 $illumina2 polyalign-splitfiltered
+python3 -m polyalign splitfasta $genome polyalign-splitfiltered
 if [ -f genome-polyalign-splitfiltered.fasta ]; then
   rm genome-polyalign-splitfiltered.fasta
 fi
@@ -67,13 +64,17 @@ for fasta in polyalign-splitfiltered/*.fasta; do
   polypolish polish $fasta polyalign-splitfiltered_1/$filename.sam polyalign-splitfiltered_2/$filename.sam >> genome-polyalign-splitfiltered.fasta
 done
 
+# polyalign in filtered mode
+python3 -m polyalign filtered $genome $illumina1 $illumina2 polyalign-filtered
+polypolish polish $genome polyalign-filtered_1.sam polyalign-filtered_2.sam > genome-polyalign-filtered.fasta
+
 # bwa and polypolish filter
 cpu=$(nproc)
-bwa index genome.fasta
-bwa mem -a -Y -t $cpu genome.fasta $illumina1 > bwa_1.sam
-bwa mem -a -Y -t $cpu genome.fasta $illumina2 > bwa_2.sam
+bwa index $genome
+bwa mem -a -Y -t $cpu $genome $illumina1 > bwa_1.sam
+bwa mem -a -Y -t $cpu $genome $illumina2 > bwa_2.sam
 polypolish filter --in1 bwa_1.sam --in2 bwa_2.sam --out1 bwa_1_filtered.sam --out2 bwa_2_filtered.sam
-polypolish polish genome.fasta bwa_1_filtered.sam bwa_2_filtered.sam > genome-polypolishfilter.fasta
+polypolish polish $genome bwa_1_filtered.sam bwa_2_filtered.sam > genome-polypolishfilter.fasta
 
-# polyalign in paired mode
-python3 -m polyalign paired genome.fasta $illumina1 $illumina2 polyalign-paired
+# polyalign in paired mode (no polish)
+python3 -m polyalign paired $genome $illumina1 $illumina2 polyalign-paired
