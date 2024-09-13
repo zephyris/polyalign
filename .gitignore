@@ -17,6 +17,7 @@ __pycache__/
 # outputs
 *.sam
 *.bam
+*.time.txt
 
 # build
 build/

@@ -1,3 +1,4 @@
+# install dependencies
 BASEDIR=$(pwd)
 cd ~
 
@@ -25,11 +26,13 @@ fi
 
 cd $BASEDIR
 
-export PATH=$PATH:~/sratoolkit/bin/:~/polypolish/target/release/
-
 python3 -m pip install git+https://github.com/zephyris/polyalign
 
-# get illumina data
+# add tools to path
+export PATH=$PATH:~/sratoolkit/bin/:~/polypolish/target/release/
+
+# get illumina and genome data
+# Leishmania mexicana genome and Illumina genome sequencing data
 function fetchsra() {
   prefetch ${1}
   fasterq-dump ${1}
@@ -45,11 +48,32 @@ if [ ! -f genome.fasta ]; then
   curl -L https://tritrypdb.org/common/downloads/release-68/LmexicanaMHOMGT2001U1103/fasta/data/TriTrypDB-68_LmexicanaMHOMGT2001U1103_Genome.fasta > genome.fasta
 fi
 
-python3 -m polyalign filtered genome.fasta $illumina1 $illumina2 polyalign
-polypolish polish genome.fasta polyalign_1.sam polyalign_2.sam > genome-polyalign.fasta
+# do the tests
 
+# with polypolish
+# polyalign in filtered mode
+python3 -m polyalign filtered genome.fasta $illumina1 $illumina2 polyalign-split
+polypolish polish genome.fasta polyalign-split_1.sam polyalign-split_2.sam > genome-polyalign-split.fasta
+
+# polyalign in splitfiltered mode
+python3 -m polyalign splitfiltered genome.fasta $illumina1 $illumina2 polyalign-splitfiltered
+python3 -m polyalign splitfasta genome.fasta polyalign-splitfiltered
+if [ -f genome-polyalign-splitfiltered.fasta ]; then
+  rm genome-polyalign-splitfiltered.fasta
+fi
+for fasta in polyalign-splitfiltered/*.fasta; do
+  filename=$(basename "$fasta")
+  filename="${filename%.*}"
+  polypolish polish $fasta polyalign-splitfiltered_1/$filename.sam polyalign-splitfiltered_2/$filename.sam >> genome-polyalign-splitfiltered.fasta
+done
+
+# bwa and polypolish filter
+cpu=$(nproc)
 bwa index genome.fasta
-bwa mem -a -Y -t 40 genome.fasta $illumina1 > bwa_1.sam
-bwa mem -a -Y -t 40 genome.fasta $illumina2 > bwa_2.sam
+bwa mem -a -Y -t $cpu genome.fasta $illumina1 > bwa_1.sam
+bwa mem -a -Y -t $cpu genome.fasta $illumina2 > bwa_2.sam
 polypolish filter --in1 bwa_1.sam --in2 bwa_2.sam --out1 bwa_1_filtered.sam --out2 bwa_2_filtered.sam
-polypolish polish genome.fasta bwa_1_filtered.sam bwa_2_filtered.sam > genome-polypolish_filter.fasta
+polypolish polish genome.fasta bwa_1_filtered.sam bwa_2_filtered.sam > genome-polypolishfilter.fasta
+
+# polyalign in paired mode
+python3 -m polyalign paired genome.fasta $illumina1 $illumina2 polyalign-paired

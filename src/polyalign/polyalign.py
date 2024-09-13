@@ -923,3 +923,44 @@ class Output:
                         self.line_buffers[l][reference] = []
                         self.open_files[l][reference].close()
 
+class Splitfasta:
+    """
+    Object to split an input file into one fasta file per contig.
+    Helper tool to prepare split fasta files, for use with splitfiltered alignments.
+    """
+    def __init__(self, fasta_path, output_path=".", output_basename="polyalign"):
+        self.fasta_path = fasta_path
+        self.output_path = output_path
+        self.output_basename = output_basename
+    
+    def splitfasta(self):
+        """
+        Split fasta file into one file per contig
+        """
+        print("[PA::SF]", "Splitting fasta file into one file per contig")
+        # make and check output directory
+        if not os.path.exists(os.path.join(self.output_path, self.output_basename)):
+            os.mkdir(os.path.join(self.output_path, self.output_basename))
+        if len(os.listdir(os.path.join(self.output_path, self.output_basename))) > 0:
+            raise ValueError("Output directory must be empty")
+        # open input file
+        with open(self.fasta_path, "r") as input_file:
+            contig_name = None
+            output_file = None
+            # read first line, then iterate
+            line = input_file.readline()
+            while line:
+                # if line is a header, setup new output and write header
+                if line[0] == ">":
+                    if output_file is not None:
+                        output_file.close()
+                    contig_name = line[1:].strip().split()[0]
+                    output_file = open(os.path.join(self.output_path, self.output_basename, contig_name+".fasta"), "w")
+                    output_file.write(line)
+                else:
+                    output_file.write(line)
+                line = input_file.readline()
+            # close final output file
+            if output_file is not None:
+                output_file.close()
+        print("[PA::SF]", "Splitting complete")
