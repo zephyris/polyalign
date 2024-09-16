@@ -264,7 +264,8 @@ class Alignment:
         0 indexed start, end position tuple
         start < end for forward, start > end for reverse
         """
-        start, end = self.pos - 1, self.pos - 1 + self.tlen
+        #start, end = self.pos - 1, self.pos - 1 + self.tlen # tlen is inconsistently set(?)
+        start, end = self.pos - 1, self.pos - 1 + self.cigarTemplateLength()
         if self.orientation() == "f":
             return start, end
         return end, start
@@ -325,6 +326,33 @@ class Alignment:
         if self.rname == "*":
             return False
         return True
+    
+    def cigarOperations(self):
+        """
+        List of cigar operations as tuples of (operation, length)
+        """
+        cigar = self.cigar
+        operations = []
+        current_length = ""
+        for char in cigar:
+            if char.isdigit():
+                current_length += char
+            else:
+                operations.append((char, int(current_length)))
+                current_length = ""
+        return operations
+
+    def cigarTemplateLength(self):
+        """
+        Length of the template from the cigar operations
+        """
+        return sum([length for operation, length in self.cigarOperations() if operation in "MDN"])
+
+    def cigarReadLength(self):
+        """
+        Length of the query from the cigar operations
+        """
+        return sum([length for operation, length in self.cigarOperations() if operation in "MIS"])
 
 class AlignmentPair:
     """
@@ -523,12 +551,15 @@ class Polyalign:
         insert_size.sort()
         insert_lower = insert_size[int(len(insert_size) * insert_size_percentile)]
         insert_upper = insert_size[int(len(insert_size) * (1 - insert_size_percentile))]
-        # clamp minimum insert_size to 2x read length
         read_length = sum(read_length) // len(read_length)
-        if insert_lower < read_length * 2:
-            insert_lower = read_length * 2
+        #if insert_lower >= insert_upper or insert_lower < read_length:
+        #    print("[PA::EISR]", "Error: Insert size range is invalid")
+        #    print("[PA::EISR]", "Read length:", read_length)
+        #    print("[PA::EISR]", "Insert size range:", insert_lower, insert_upper)
+        #    raise ValueError("Insert size range is invalid")
         # print result
         print("[PA::EISR]", "Result:")
+        print("[PA::EISR]", "Read length:", read_length)
         print("[PA::EISR]", "Insert size "+str(insert_size_percentile * 100)+"% and "+str(100 - insert_size_percentile * 100)+"% percentile:", insert_lower, insert_upper)
         print("[PA::EISR]", "Orientation:", ", ".join([x[0]+": "+str(x[1]) for x in orientation.items()]))
         # set properties
