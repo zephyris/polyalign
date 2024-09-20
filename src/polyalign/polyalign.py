@@ -677,12 +677,11 @@ class Polyalign:
             program_line = Header(["@PG", "ID:polyalign", "PN:polyalign", "VN:0.0.0", "CL:"+" ".join(command)])
             return sam_1.readHeader() + [program_line], sam_2.readHeader() + [program_line]
 
-        def readBatchAnalysis(chunk_length=1000, multiprocess_mode="process", workers=None):
+        def readBatchAnalysis(chunk_length=100000, chunks_per_worker=3, multiprocess_mode="thread", workers=None):
             """
             Run analysis_function on list of reads, return processed list
             """
             # set number of workers
-            chunks_per_worker = 10
             if workers is None:
                 workers = multiprocessing.cpu_count()
             else:

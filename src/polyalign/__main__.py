@@ -23,7 +23,7 @@ if __name__ == "__main__":
             sys.exit(1)
     elif len(sys.argv) == 6:
         polyalign = Polyalign(sys.argv[2], sys.argv[3], sys.argv[4], output_basename=sys.argv[5], output_type=sys.argv[1])
-        polyalign.polyalign()
+        polyalign.polyalign(mode="serial")
     else:
         print_help()
         sys.exit(1)
