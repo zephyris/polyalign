@@ -430,18 +430,21 @@ class Polyalign:
     Object to handle separate exhaustive bwa alignments of left and right reads.
     Estimates insert size and returns sam of only accepted best pairings.
     """
-    def __init__(self, subject_path, reads_1_path, reads_2_path, output_path=".", output_basename="polyalign", output_type="filtered", retain_unmapped=None, read_orientation=None, insert_size_range=None, bwa_options={}, do_bwa_indexing=True):
+    def __init__(self, subject_path, reads_1_path, reads_2_path, output_path=".", output_basename="polyalign", output_type="filtered", retain_unmapped=None, read_orientation=None, insert_size_range=None, bwa_options={}, do_bwa_indexing=True, bwa_workers=None, python_workers=None):
         self.subject_path = subject_path
         self.reads_1_path = reads_1_path
         self.reads_2_path = reads_2_path
         self.output_path = output_path
         self.output_basename = output_basename
         self.output_type = output_type
+        # set workers
+        self.bwa_workers = bwa_workers
+        self.python_workers = python_workers
         # set necessary bwa options, -a and -Y flags
         bwa_options["a"] = None
         bwa_options["Y"] = None
         # initialise bwa mem
-        self.bwa_mem = BwaMem(subject_path, bwa_options, do_indexing=do_bwa_indexing)
+        self.bwa_mem = BwaMem(subject_path, bwa_options, do_indexing=do_bwa_indexing, cpus=bwa_workers)
         # set read orientation and insert size, fetching automatically if necessary
         self.read_orientation = read_orientation
         self.insert_size_range = insert_size_range
@@ -682,6 +685,9 @@ class Polyalign:
             chunks_per_worker = 10
             if workers is None:
                 workers = multiprocessing.cpu_count()
+            else:
+                workers = min(max(1, workers), multiprocessing.cpu_count())
+            print("[PA::RBA]", "Workers:", workers, "Chunks per worker:", chunks_per_worker, "Chunk length:", chunk_length, "Multiprocessing mode:", multiprocess_mode)
             # setup multiprocessing mode
             if multiprocess_mode is None:
                 # run in a single thread, still use the ThreadPoolExecutor since that's equivalent
@@ -755,11 +761,11 @@ class Polyalign:
         output.writeHeader(header_1, header_1)
         # alignment and filtering
         if mode == "parallel":
-            results = readBatchAnalysis()
+            results = readBatchAnalysis(workers=self.python_workers)
             while len(results[0]) > 0 and len(results[1]) > 0:
                 print("[PA::PA]", "Stats:", ", ".join([x[0]+": "+str(x[1]) for x in self.stats.items()]))
                 output.writeAlignment(results[0], results[1])
-                results = readBatchAnalysis()
+                results = readBatchAnalysis(workers=self.python_workers)
         elif mode == "serial":
             next_read_1 = sam_1.nextRead()
             next_read_2 = sam_2.nextRead()
