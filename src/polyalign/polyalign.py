@@ -1,4 +1,4 @@
-import os, sys, subprocess, multiprocessing, concurrent.futures, time, random
+import os, sys, subprocess, multiprocessing, concurrent.futures, time, random, copy
 import functools
 from tqdm.auto import tqdm
 
@@ -116,7 +116,7 @@ class BwaMem:
             lines = [line.copy()]
             while next(self) is not None and self.current[0][0] == "@":
                 lines.append(self.current.copy())
-            return [Header(line) for line in lines]
+            return lines
         
         def nextRead(self):
             """
@@ -129,7 +129,7 @@ class BwaMem:
             lines = [line.copy()]
             while next(self) is not None and lines[0][0]==self.current_id:
                 lines.append(self.current.copy())
-            return [Alignment(line) for line in lines]
+            return lines
     
     def mem(self, reads_1_path, reads_2_path=None):
         """
@@ -423,39 +423,12 @@ class AlignmentPair:
             return True
         return False
 
-
-
-class Polyalign:
-    """
-    Object to handle separate exhaustive bwa alignments of left and right reads.
-    Estimates insert size and returns sam of only accepted best pairings.
-    """
-    def __init__(self, subject_path, reads_1_path, reads_2_path, output_path=".", output_basename="polyalign", output_type="filtered", retain_unmapped=None, read_orientation=None, insert_size_range=None, bwa_options={}, do_bwa_indexing=True, bwa_workers=None, python_workers=None):
-        self.subject_path = subject_path
-        self.reads_1_path = reads_1_path
-        self.reads_2_path = reads_2_path
-        self.output_path = output_path
-        self.output_basename = output_basename
-        self.output_type = output_type
-        # set workers
-        self.bwa_workers = bwa_workers
-        self.python_workers = python_workers
-        # set necessary bwa options, -a and -Y flags
-        bwa_options["a"] = None
-        bwa_options["Y"] = None
-        # initialise bwa mem
-        self.bwa_mem = BwaMem(subject_path, bwa_options, do_indexing=do_bwa_indexing, cpus=bwa_workers)
-        # set read orientation and insert size, fetching automatically if necessary
+class AlignmentPairFilter:
+    def __init__(self, read_orientation=None, insert_size_range=None, retain_unmapped=None):
         self.read_orientation = read_orientation
         self.insert_size_range = insert_size_range
-        if self.read_orientation is None or self.insert_size_range is None:
-            self.estimateInsertSizeRange()
         self.retain_unmapped = retain_unmapped
-        if self.retain_unmapped is None and output_type == "paired":
-            self.retain_unmapped = False
-        else:
-            self.retain_unmapped = True
-
+    
     def isSinglePair(self, read_1, read_2):
         """
         Check if read_1 and read_2 have length 1, ie. single alignment of paired reads
@@ -501,78 +474,6 @@ class Polyalign:
                     good_1[index_1] = True
                     good_2[index_2] = True
         return [read_1[index] for index, value in enumerate(good_1) if value], [read_2[index] for index, value in enumerate(good_2) if value]
-    
-    def estimateInsertSizeRange(self, read_sample = 100000, insert_size_percentile = 0.01):
-        """
-        Using a sample of read_sample reads, estimate insert size distribution.
-        Return an acceptable size range of 1st to 99th percentile.
-        """
-        def sampleReads(input_path, output_path, read_sample):
-            with open(input_path, "r") as input_file:
-                with open(output_path, "w") as output_file:
-                    count = 0
-                    while count < read_sample * 4:
-                        line = input_file.readline()
-                        if not line:
-                            break
-                        output_file.write(line)
-                        count += 1
-        
-        print("[PA::EISR]", "Getting mate pair properties from read subset alignment")
-        # output stats
-        insert_size = []
-        orientation = {"fr": 0, "ff": 0, "rr": 0, "rf": 0}
-        read_length = []
-        # sample reads
-        print("[PA::EISR]", "Sampling "+str(read_sample)+" reads")
-        sampleReads(self.reads_1_path, "tmp1.fastq.tmp", read_sample)
-        sampleReads(self.reads_2_path, "tmp2.fastq.tmp", read_sample)
-        # do alignment
-        sam_1 = self.bwa_mem.mem("tmp1.fastq.tmp")
-        sam_2 = self.bwa_mem.mem("tmp2.fastq.tmp")
-        # get stats
-        # read and ignore header lines
-        sam_1.readLine()
-        sam_1.readHeader()
-        sam_2.readLine()
-        sam_2.readHeader()
-        # iterate through sets of alignment for each read
-        next_read_1 = sam_1.nextRead()
-        next_read_2 = sam_2.nextRead()
-        while next_read_1 is not None:
-            # if a single pair
-            if self.isSinglePair(next_read_1, next_read_2):
-                # get and record statsenumerate
-                read_pair = AlignmentPair(next_read_1[0], next_read_2[0])
-                if read_pair.sameReference():
-                    insert_size.append(read_pair.insertSize())
-                    orientation[read_pair.orientation()] += 1
-                    read_length += read_pair.readLength()
-            next_read_1 = sam_1.nextRead()
-            next_read_2 = sam_2.nextRead()
-        # analyse insert_size
-        insert_size.sort()
-        insert_lower = insert_size[int(len(insert_size) * insert_size_percentile)]
-        insert_upper = insert_size[int(len(insert_size) * (1 - insert_size_percentile))]
-        read_length = sum(read_length) // len(read_length)
-        #if insert_lower >= insert_upper or insert_lower < read_length:
-        #    print("[PA::EISR]", "Error: Insert size range is invalid")
-        #    print("[PA::EISR]", "Read length:", read_length)
-        #    print("[PA::EISR]", "Insert size range:", insert_lower, insert_upper)
-        #    raise ValueError("Insert size range is invalid")
-        # print result
-        print("[PA::EISR]", "Result:")
-        print("[PA::EISR]", "Read length:", read_length)
-        print("[PA::EISR]", "Insert size "+str(insert_size_percentile * 100)+"% and "+str(100 - insert_size_percentile * 100)+"% percentile:", insert_lower, insert_upper)
-        print("[PA::EISR]", "Orientation:", ", ".join([x[0]+": "+str(x[1]) for x in orientation.items()]))
-        # set properties
-        if self.read_orientation is None:
-            self.read_orientation = max(orientation, key=orientation.get)
-        if self.insert_size_range is None:
-            self.insert_size_range = (insert_lower, insert_upper)
-        # remove temporary files
-        os.remove("tmp1.fastq.tmp")
-        os.remove("tmp2.fastq.tmp")
 
     def analyseReadPairing(self, next_read_1, next_read_2):
         """
@@ -642,26 +543,138 @@ class Polyalign:
             status = "good pairs from multiple both aligned"
             return good_1, good_2, status
 
-    def batchChunkWorker(self, chunk=None):
+class Polyalign:
+    """
+    Object to handle separate exhaustive bwa alignments of left and right reads.
+    Estimates insert size and returns sam of only accepted best pairings.
+    """
+    def __init__(self, subject_path, reads_1_path, reads_2_path, output_path=".", output_basename="polyalign", output_type="filtered", retain_unmapped=None, read_orientation=None, insert_size_range=None, bwa_options={}, do_bwa_indexing=True, bwa_workers=None, python_workers=None):
+        self.subject_path = subject_path
+        self.reads_1_path = reads_1_path
+        self.reads_2_path = reads_2_path
+        self.output_path = output_path
+        self.output_basename = output_basename
+        self.output_type = output_type
+        # set workers
+        self.bwa_workers = bwa_workers
+        self.python_workers = python_workers
+        # set necessary bwa options, -a and -Y flags
+        bwa_options["a"] = None
+        bwa_options["Y"] = None
+        # initialise bwa mem
+        self.bwa_mem = BwaMem(subject_path, bwa_options, do_indexing=do_bwa_indexing, cpus=bwa_workers)
+        # set read orientation and insert size, fetching automatically if necessary
+        self.read_orientation = read_orientation
+        self.insert_size_range = insert_size_range
+        if self.read_orientation is None or self.insert_size_range is None:
+            self.estimateInsertSizeRange()
+        self.retain_unmapped = retain_unmapped
+        if self.retain_unmapped is None and output_type == "paired":
+            self.retain_unmapped = False
+        else:
+            self.retain_unmapped = True
+
+    def estimateInsertSizeRange(self, read_sample = 100000, insert_size_percentile = 0.01):
         """
-        Run analysis_function on list of reads, using multiprocessing or multithreading
+        Using a sample of read_sample reads, estimate insert size distribution.
+        Return an acceptable size range of 1st to 99th percentile.
         """
+        def sampleReads(input_path, output_path, read_sample):
+            with open(input_path, "r") as input_file:
+                with open(output_path, "w") as output_file:
+                    count = 0
+                    while count < read_sample * 4:
+                        line = input_file.readline()
+                        if not line:
+                            break
+                        output_file.write(line)
+                        count += 1
+        
+        print("[PA::EISR]", "Getting mate pair properties from read subset alignment")
+        # output stats
+        insert_size = []
+        orientation = {"fr": 0, "ff": 0, "rr": 0, "rf": 0}
+        read_length = []
+        # sample reads
+        print("[PA::EISR]", "Sampling "+str(read_sample)+" reads")
+        sampleReads(self.reads_1_path, "tmp1.fastq.tmp", read_sample)
+        sampleReads(self.reads_2_path, "tmp2.fastq.tmp", read_sample)
+        # do alignment
+        sam_1 = self.bwa_mem.mem("tmp1.fastq.tmp")
+        sam_2 = self.bwa_mem.mem("tmp2.fastq.tmp")
+        # get stats
+        # read and ignore header lines
+        sam_1.readLine()
+        sam_1.readHeader()
+        sam_2.readLine()
+        sam_2.readHeader()
+        # iterate through sets of alignment for each read
+        next_read_1 = None if sam_1.readLine() is None else [Alignment(line) for line in sam_1.nextRead()]
+        next_read_2 = None if sam_2.readLine() is None else [Alignment(line) for line in sam_2.nextRead()]
+        PairFilter = AlignmentPairFilter()
+        while next_read_1 is not None and next_read_2 is not None:
+            # if a single pair
+            if PairFilter.isSinglePair(next_read_1, next_read_2):
+                # get and record stats
+                read_pair = AlignmentPair(next_read_1[0], next_read_2[0])
+                if read_pair.sameReference():
+                    insert_size.append(read_pair.insertSize())
+                    orientation[read_pair.orientation()] += 1
+                    read_length += read_pair.readLength()
+            next_read_1 = None if sam_1.readLine() is None else [Alignment(line) for line in sam_1.nextRead()]
+            next_read_2 = None if sam_2.readLine() is None else [Alignment(line) for line in sam_2.nextRead()]
+        # analyse insert_size
+        insert_size.sort()
+        insert_lower = insert_size[int(len(insert_size) * insert_size_percentile)]
+        insert_upper = insert_size[int(len(insert_size) * (1 - insert_size_percentile))]
+        read_length = sum(read_length) // len(read_length)
+        #if insert_lower >= insert_upper or insert_lower < read_length:
+        #    print("[PA::EISR]", "Error: Insert size range is invalid")
+        #    print("[PA::EISR]", "Read length:", read_length)
+        #    print("[PA::EISR]", "Insert size range:", insert_lower, insert_upper)
+        #    raise ValueError("Insert size range is invalid")
+        # print result
+        print("[PA::EISR]", "Result:")
+        print("[PA::EISR]", "Read length:", read_length)
+        print("[PA::EISR]", "Insert size "+str(insert_size_percentile * 100)+"% and "+str(100 - insert_size_percentile * 100)+"% percentile:", insert_lower, insert_upper)
+        print("[PA::EISR]", "Orientation:", ", ".join([x[0]+": "+str(x[1]) for x in orientation.items()]))
+        # set properties
+        if self.read_orientation is None:
+            self.read_orientation = max(orientation, key=orientation.get)
+        if self.insert_size_range is None:
+            self.insert_size_range = (insert_lower, insert_upper)
+        # remove temporary files
+        os.remove("tmp1.fastq.tmp")
+        os.remove("tmp2.fastq.tmp")
+
+    def batchChunkWorker(self, chunk):
+        """
+        Run pairing analysis on list of reads
+        """
+        start_time = time.time()
+        # parse lines as alignments
+        chunk["list_1"] = [[Alignment(line) for line in read] for read in chunk["list_1"]]
+        chunk["list_2"] = [[Alignment(line) for line in read] for read in chunk["list_2"]]
+        # do filtering
+        PairFilter = AlignmentPairFilter(chunk["read_orientation"], chunk["insert_size_range"], chunk["retain_unmapped"])
         current_stats = {}
         result_1, result_2 = [], []
         for index in range(len(chunk["list_1"])):
-            curr_result_1, curr_result_2, status = self.analyseReadPairing(chunk["list_1"][index], chunk["list_2"][index])
+            curr_result_1, curr_result_2, status = PairFilter.analyseReadPairing(chunk["list_1"][index], chunk["list_2"][index])
             if curr_result_1 is not None and curr_result_2 is not None and status is not None:
                 result_1.append(curr_result_1)
                 result_2.append(curr_result_2)
                 if status not in current_stats:
                     current_stats[status] = 0
                 current_stats[status] += 1
-        result = {
+        time_taken = time.time() - start_time
+        print("[PA::BCW]", len(chunk["list_1"]), "reads analysed in", round(time_taken, 3), "real sec")
+        print("[PA::BCW]", "Index:", chunk["index"], "Stats:", ", ".join([x[0]+": "+str(x[1]) for x in current_stats.items()]))
+        return {
             "index": chunk["index"],
-            "chunk": (result_1, result_2),
-            "stats": current_stats
+            "stats": current_stats,
+            "result": (result_1, result_2)
         }
-        return result
 
     def polyalign(self, mode="parallel"):
         """
@@ -675,70 +688,10 @@ class Polyalign:
             command = sys.argv.copy()
             command[0] = os.path.basename(command[0])
             program_line = Header(["@PG", "ID:polyalign", "PN:polyalign", "VN:0.0.0", "CL:"+" ".join(command)])
-            return sam_1.readHeader() + [program_line], sam_2.readHeader() + [program_line]
-
-        def readBatchAnalysis(chunk_length=100000, chunks_per_worker=3, multiprocess_mode="thread", workers=None):
-            """
-            Run analysis_function on list of reads, return processed list
-            """
-            # set number of workers
-            if workers is None:
-                workers = multiprocessing.cpu_count()
-            else:
-                workers = min(max(1, workers), multiprocessing.cpu_count())
-            print("[PA::RBA]", "Workers:", workers, "Chunks per worker:", chunks_per_worker, "Chunk length:", chunk_length, "Multiprocessing mode:", multiprocess_mode)
-            # setup multiprocessing mode
-            if multiprocess_mode is None:
-                # run in a single thread, still use the ThreadPoolExecutor since that's equivalent
-                #print("[PA::RBA]", "Single thread")
-                Executor = concurrent.futures.ThreadPoolExecutor
-                workers = 1
-            elif multiprocess_mode == "process":
-                #print("[PA::RBA]", "Parallel processes with", workers, "workers")
-                # setup executor as a process pool
-                Executor = concurrent.futures.ProcessPoolExecutor
-            elif multiprocess_mode == "thread":
-                # setup executor as a thread pool
-                #print("[PA::RBA]", "Parallel threads with", workers, "workers")
-                Executor = concurrent.futures.ThreadPoolExecutor
-            else:
-                raise ValueError(f"Unknown multiprocess_mode '{multiprocess_mode}")
-            # fetch data for worklist
-            list_chunks = []
-            for i in range(workers * chunks_per_worker):
-                list_chunks.append({"index": i, "list_1": [], "list_2": []})
-                for j in range(chunk_length):
-                    next_read_1 = sam_1.nextRead()
-                    next_read_2 = sam_2.nextRead()
-                    if next_read_1 is not None and next_read_2 is not None:
-                        list_chunks[i]["list_1"].append(next_read_1)
-                        list_chunks[i]["list_2"].append(next_read_2)
-            start_time = time.time()
-            print("[PA::RBA]", "Analysing read pairing,", len(list_chunks), "chunks of", len(list_chunks[0]["list_1"]), "read pairs with", workers, "workers")
-            # fire up executor
-            with Executor(workers) as executor:
-                futures = [executor.submit(self.batchChunkWorker, chunk=chunk) for chunk in list_chunks]
-                results = [future.result() for future in tqdm(concurrent.futures.as_completed(futures), total=len(futures), smoothing=0, disable=True)]
-            # reconstruct stats
-            for result in results:
-                for key in result["stats"]:
-                    if key not in self.stats:
-                        self.stats[key] = 0
-                    self.stats[key] += result["stats"][key]
-            # sort by chunk index and reconstruct results
-            results.sort(key=lambda x: x["index"])
-            result_1, result_2 = [], []
-            for result in results:
-                result_1 += result["chunk"][0]
-                result_2 += result["chunk"][1]
-            # time taken
-            time_taken = time.time() - start_time
-            print("[PA::RBA]", sum([len(x["list_1"]) for x in list_chunks]), "reads analysed in", round(time_taken * workers, 3), "CPU sec,", round(time_taken, 3), "real sec")
-            return (result_1, result_2)
+            return [Header(line) for line in sam_1.readHeader()] + [program_line], [Header(line) for line in sam_2.readHeader()] + [program_line]
 
         print("[PA::PA]", "Polyaligning in", self.output_type, "mode")
         # set mode
-        mode = "parallel"
         if mode is None:
             mode = "parallel"
         if mode not in ["serial", "parallel"]:
@@ -759,30 +712,90 @@ class Polyalign:
         header_1, header_2 = returnHeader()
         output.writeHeader(header_1, header_1)
         # alignment and filtering
-        if mode == "parallel":
-            results = readBatchAnalysis(workers=self.python_workers)
-            while len(results[0]) > 0 and len(results[1]) > 0:
-                print("[PA::PA]", "Stats:", ", ".join([x[0]+": "+str(x[1]) for x in self.stats.items()]))
-                output.writeAlignment(results[0], results[1])
-                results = readBatchAnalysis(workers=self.python_workers)
-        elif mode == "serial":
-            next_read_1 = sam_1.nextRead()
-            next_read_2 = sam_2.nextRead()
-            alignment_1, alignment_2, status = self.analyseReadPairing(next_read_1, next_read_2)
-            while alignment_1 is not None and alignment_2 is not None:
-                read_index += 1
-                if status is not None:
-                    if status not in self.stats:
-                        self.stats[status] = 0
-                    self.stats[status] += 1
-                if read_index % 100000 == 0:
-                    print("[PA::PA]", "Stats:", ", ".join([x[0]+": "+str(x[1]) for x in self.stats.items()]))
-                output.writeAlignment([alignment_1], [alignment_2])
-                alignment_1, alignment_2, status = self.analyseReadPairing(next_read_1, next_read_2)
+        # set multiprocess parameters
+        chunk_length = 100000
+        multiprocess_mode = "process"
+        workers = self.python_workers
+        if workers is None:
+            ## capped to 6 workers, as scaling tests 
+            #workers = min(multiprocessing.cpu_count(), 6)
+            workers = multiprocessing.cpu_count()
+        else:
+            workers = min(max(1, workers), multiprocessing.cpu_count())
+        if mode == "serial" or workers == 1:
+            multiprocess_mode = None
+            workers = 1
+        # setup executor for multiprocessing mode
+        if multiprocess_mode is None:
+            # run in a single thread, single ThreadPoolExecutor is equivalent to simple ongoing script
+            Executor = concurrent.futures.ThreadPoolExecutor
+            workers = 1
+        elif multiprocess_mode == "process":
+            Executor = concurrent.futures.ProcessPoolExecutor
+        elif multiprocess_mode == "thread":
+            Executor = concurrent.futures.ThreadPoolExecutor
+        else:
+            raise ValueError(f"Unknown multiprocess_mode '{multiprocess_mode}")
+        print("[PA::RBA]", "Workers:", workers, "Chunk length:", chunk_length, "Multiprocessing mode:", multiprocess_mode)
+        # start execution
+        # helper function for prepping a chunk
+        def prep_chunk_length(sam_1, sam_2, chunk_length, i):
+            chunk = {"index": i, "list_1": [], "list_2": [], "read_orientation": self.read_orientation, "insert_size_range": self.insert_size_range, "retain_unmapped": self.retain_unmapped}
+            for j in range(chunk_length):
+                next_read_1 = sam_1.nextRead()
+                next_read_2 = sam_2.nextRead()
+                if next_read_1 is not None and next_read_2 is not None:
+                    chunk["list_1"].append(next_read_1)
+                    chunk["list_2"].append(next_read_2)
+            return chunk
+        # helper function for handling output
+        def handle_output(result):
+            for status in result["stats"]:
+                if status not in self.stats:
+                    self.stats[status] = 0
+                self.stats[status] += result["stats"][status]
+            output.writeAlignment(result["result"][0], result["result"][1])
+        # fire up executor
+        with Executor(workers) as executor:
+            futures = []
+            # send starting work chunks, triple the number of workers
+            do_chunk = True
+            i = 0
+            while do_chunk and i < workers * 3:
+                chunk = prep_chunk_length(sam_1, sam_2, chunk_length, i)
+                i += 1
+                if len(chunk["list_1"]) and len(chunk["list_2"]) > 0:
+                    futures.append(executor.submit(self.batchChunkWorker, chunk=copy.deepcopy(chunk)))
+                else:
+                    do_chunk = False
+            # assemble further work chunks, one for each new result that is complete
+            do_chunk = True
+            while do_chunk:
+                # loop through all futures, check if done and handle output
+                completed = 0
+                for j in range(len(futures), 0, -1):
+                    future = futures[j-1]
+                    if future.done():
+                        completed += 1
+                        futures.pop(j-1)
+                        result = future.result()
+                        handle_output(result)
+                # for each completed future, add a new chunk
+                for c in range(completed):
+                    chunk = prep_chunk_length(sam_1, sam_2, chunk_length, i)
+                    i += 1
+                    if len(chunk["list_1"]) and len(chunk["list_2"]) > 0:
+                        futures.append(executor.submit(self.batchChunkWorker, chunk=copy.deepcopy(chunk)))
+                    else:
+                        do_chunk = False
+            # wait for all remaining futures to complete and handle output
+            for future in concurrent.futures.as_completed(futures):
+                result = future.result()
+                handle_output(result)
         # end output
         output.closeOutput()
+        print("[PA::PA]", "Stats:", ", ".join([x[0]+": "+str(x[1]) for x in self.stats.items()]))
         print("[PA::PA]", "End of bwa mem output reached")
-        print("[PA::PA]", "Final stats:", ", ".join([x[0]+": "+str(x[1]) for x in self.stats.items()]))
         print("[PA::PA]", "Polyaligning complete")
 
 class Output:
@@ -877,7 +890,7 @@ class Output:
                                 referencename = entry[3:]
                         # setup output buffer for each reference sequence, with @SQ specific to output file
                         self.line_buffers[h][referencename] = []
-                        self.line_buffers[h][referencename].append(line)                
+                        self.line_buffers[h][referencename].append(line)
                     else:
                         # all other header lines to all files
                         for reference in self.line_buffers[h]:
