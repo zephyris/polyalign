@@ -740,6 +740,7 @@ class Polyalign:
         # start execution
         # helper function for prepping a chunk
         def prep_chunk_length(sam_1, sam_2, chunk_length, i):
+            start_time = time.time()
             chunk = {"index": i, "list_1": [], "list_2": [], "read_orientation": self.read_orientation, "insert_size_range": self.insert_size_range, "retain_unmapped": self.retain_unmapped}
             for j in range(chunk_length):
                 next_read_1 = sam_1.nextRead()
@@ -747,51 +748,69 @@ class Polyalign:
                 if next_read_1 is not None and next_read_2 is not None:
                     chunk["list_1"].append(next_read_1)
                     chunk["list_2"].append(next_read_2)
+            end_time = time.time() - start_time
+            print("[PA::PA]", "Data for chunk", i, "read in", round(end_time, 3), "real sec")
             return chunk
         # helper function for handling output
         def handle_output(result):
+            start_time = time.time()
             for status in result["stats"]:
                 if status not in self.stats:
                     self.stats[status] = 0
                 self.stats[status] += result["stats"][status]
             output.writeAlignment(result["result"][0], result["result"][1])
-        # fire up executor
-        with Executor(workers) as executor:
-            futures = []
-            # send starting work chunks, triple the number of workers
-            do_chunk = True
-            i = 0
-            while do_chunk and i < workers * 3:
-                chunk = prep_chunk_length(sam_1, sam_2, chunk_length, i)
-                i += 1
-                if len(chunk["list_1"]) and len(chunk["list_2"]) > 0:
-                    futures.append(executor.submit(self.batchChunkWorker, chunk=copy.deepcopy(chunk)))
-                else:
-                    do_chunk = False
-            # assemble further work chunks, one for each new result that is complete
-            do_chunk = True
-            while do_chunk:
-                # loop through all futures, check if done and handle output
-                completed = 0
-                for j in range(len(futures), 0, -1):
-                    future = futures[j-1]
-                    if future.done():
-                        completed += 1
-                        futures.pop(j-1)
-                        result = future.result()
-                        handle_output(result)
-                # for each completed future, add a new chunk
-                for c in range(completed):
+            end_time = time.time() - start_time
+            print("[PA::PA]", "Chunk", result["index"], "output in", round(end_time, 3), "real sec")
+        if workers > 1:
+            # fire up executor
+            with Executor(workers) as executor:
+                futures = []
+                # send starting work chunks, triple the number of workers
+                do_chunk = True
+                i = 0
+                while do_chunk and i < workers * 3:
                     chunk = prep_chunk_length(sam_1, sam_2, chunk_length, i)
                     i += 1
                     if len(chunk["list_1"]) and len(chunk["list_2"]) > 0:
                         futures.append(executor.submit(self.batchChunkWorker, chunk=copy.deepcopy(chunk)))
                     else:
                         do_chunk = False
-            # wait for all remaining futures to complete and handle output
-            for future in concurrent.futures.as_completed(futures):
-                result = future.result()
-                handle_output(result)
+                # assemble further work chunks, one for each new result that is complete
+                do_chunk = True
+                while do_chunk:
+                    # loop through all futures, check if done and handle output
+                    completed = 0
+                    for j in range(len(futures), 0, -1):
+                        future = futures[j-1]
+                        if future.done():
+                            completed += 1
+                            futures.pop(j-1)
+                            result = future.result()
+                            handle_output(result)
+                    # for each completed future, add a new chunk
+                    for c in range(completed):
+                        chunk = prep_chunk_length(sam_1, sam_2, chunk_length, i)
+                        i += 1
+                        if len(chunk["list_1"]) and len(chunk["list_2"]) > 0:
+                            futures.append(executor.submit(self.batchChunkWorker, chunk=copy.deepcopy(chunk)))
+                        else:
+                            do_chunk = False
+                # wait for all remaining futures to complete and handle output
+                for future in concurrent.futures.as_completed(futures):
+                    result = future.result()
+                    handle_output(result)
+        else:
+            # single thread
+            do_chunk = True
+            i = 0
+            while do_chunk:
+                chunk = prep_chunk_length(sam_1, sam_2, chunk_length, i)
+                i += 1
+                if len(chunk["list_1"]) and len(chunk["list_2"]) > 0:
+                    result = self.batchChunkWorker(chunk=chunk)
+                    handle_output(result)
+                else:
+                    do_chunk = False
         # end output
         output.closeOutput()
         print("[PA::PA]", "Stats:", ", ".join([x[0]+": "+str(x[1]) for x in self.stats.items()]))
