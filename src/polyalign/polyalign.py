@@ -135,12 +135,13 @@ class BwaMem:
         """
         Do alignment using bwa mem of reads_1_path (and optionally reads_2_path).
         """
-        command = [self.program, "mem", "-t", self.cpus, self.subject_path]
+        command = [self.program, "mem", "-t", self.cpus]
         for option in self.options:
             if self.options[option] is not None:
                 command += ["-" + option, self.options[option]]
             else:
                 command += ["-" + option]
+        command += [self.subject_path]
         command += [reads_1_path]
         if reads_2_path is not None:
             command += [reads_2_path]
