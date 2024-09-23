@@ -778,23 +778,26 @@ class Polyalign:
                 # assemble further work chunks, one for each new result that is complete
                 do_chunk = True
                 while do_chunk:
-                    # loop through all futures, check if done and handle output
-                    completed = 0
+                    # loop through all futures, check if done and record
+                    completed = []
                     for j in range(len(futures), 0, -1):
-                        future = futures[j-1]
-                        if future.done():
-                            completed += 1
-                            futures.pop(j-1)
-                            result = future.result()
-                            handle_output(result)
-                    # for each completed future, add a new chunk
-                    for c in range(completed):
+                        if futures[j-1].done():
+                            completed.append(j-1)
+                    # for each completed future, prepare a new chunk and submit
+                    for c in range(len(completed)):
                         chunk = prep_chunk_length(sam_1, sam_2, chunk_length, i)
                         i += 1
                         if len(chunk["list_1"]) and len(chunk["list_2"]) > 0:
                             futures.append(executor.submit(self.batchChunkWorker, chunk=copy.deepcopy(chunk)))
                         else:
                             do_chunk = False
+                    # handle output from completed futures and pop
+                    # done after submitting new work to keep executor alive
+                    for j in range(len(futures), 0, -1):
+                        if j-1 in completed:
+                            future = futures.pop(j-1)
+                            result = future.result()
+                            handle_output(result)
                 # wait for all remaining futures to complete and handle output
                 for future in concurrent.futures.as_completed(futures):
                     result = future.result()
