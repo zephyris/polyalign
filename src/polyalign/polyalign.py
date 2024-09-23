@@ -609,10 +609,16 @@ class Polyalign:
         sam_2.readLine()
         sam_2.readHeader()
         # iterate through sets of alignment for each read
-        next_read_1 = None if sam_1.readLine() is None else [Alignment(line) for line in sam_1.nextRead()]
-        next_read_2 = None if sam_2.readLine() is None else [Alignment(line) for line in sam_2.nextRead()]
+        next_read_1 = sam_1.nextRead()
+        next_read_2 = sam_2.nextRead()
         PairFilter = AlignmentPairFilter()
         while next_read_1 is not None and next_read_2 is not None:
+            next_read_1 = [Alignment(line) for line in next_read_1]
+            next_read_2 = [Alignment(line) for line in next_read_2]
+            # check for read name matching errors
+            if next_read_1[0].qname != next_read_2[0].qname:
+                print("[PA::EISR]", "Error: Read names do not match")
+                raise ValueError("Read names do not match, are the reads the same order in the two FASTQ files?")
             # if a single pair
             if PairFilter.isSinglePair(next_read_1, next_read_2):
                 # get and record stats
@@ -621,18 +627,23 @@ class Polyalign:
                     insert_size.append(read_pair.insertSize())
                     orientation[read_pair.orientation()] += 1
                     read_length += read_pair.readLength()
-            next_read_1 = None if sam_1.readLine() is None else [Alignment(line) for line in sam_1.nextRead()]
-            next_read_2 = None if sam_2.readLine() is None else [Alignment(line) for line in sam_2.nextRead()]
+            next_read_1 = sam_1.nextRead()
+            next_read_2 = sam_2.nextRead()
         # analyse insert_size
         insert_size.sort()
         insert_lower = insert_size[int(len(insert_size) * insert_size_percentile)]
         insert_upper = insert_size[int(len(insert_size) * (1 - insert_size_percentile))]
         read_length = sum(read_length) // len(read_length)
-        #if insert_lower >= insert_upper or insert_lower < read_length:
-        #    print("[PA::EISR]", "Error: Insert size range is invalid")
-        #    print("[PA::EISR]", "Read length:", read_length)
-        #    print("[PA::EISR]", "Insert size range:", insert_lower, insert_upper)
-        #    raise ValueError("Insert size range is invalid")
+        if len(insert_size) == 0:
+            print("[PA::EISR]", "Error: No valid pairs found from " + str(read_sample) + " sampled reads")
+            raise ValueError("No valid pairs found")
+        if len(insert_size) < read_sample / 2:
+            print("[PA::EISR]", "Warning: Fewer than 50% of reads have valid pairs")
+        if insert_lower >= insert_upper or insert_lower < read_length:
+            print("[PA::EISR]", "Error: Insert size range is invalid")
+            print("[PA::EISR]", "Read length:", read_length)
+            print("[PA::EISR]", "Insert size range:", insert_lower, insert_upper)
+            raise ValueError("Insert size range is invalid")
         # print result
         print("[PA::EISR]", "Result:")
         print("[PA::EISR]", "Read length:", read_length)
