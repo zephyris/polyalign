@@ -504,7 +504,7 @@ class AlignmentPairFilter:
             return next_read_1, next_read_2, status
         if self.isSinglePair(next_read_1, next_read_2):
             # For pairs where one has zero alignments, keep sam lines, ie. treat single alignments as correct.
-            status = "unique both aligned"
+            status = "both unique aligned"
             return next_read_1, next_read_2, status
         # For pairs with multiple alignments, keep sam lines if it pairs (same ref seq, correct ori, good insert) with any of its pair's alignments.
         good_1, good_2 = self.findGoodPairs(next_read_1, next_read_2)
@@ -517,14 +517,14 @@ class AlignmentPairFilter:
                 if read_2 not in good_2:
                     read_2.setOptional("ZP", "fail", "Z")
             if len(good_1) == 0 or len(good_2) == 0:
-                status = "no good pairs from multiple both aligned"
+                status = "no good pairs from multiple"
             else:
-                status = "good pairs from multiple both aligned"
+                status = "good pairs from multiple"
             return next_read_1, next_read_2, status
         else:
             # keep only good read alignments
             if len(good_1) == 0 or len(good_2) == 0:
-                status = "no good pairs from multiple both aligned"
+                status = "no good pairs from multiple"
                 return [], [], status
             for index, good in enumerate(good_1):
                 # add sequence and quality to first good reads, replace with "*" for the rest
@@ -541,7 +541,7 @@ class AlignmentPairFilter:
                 else:
                     good.seq = "*"
                     good.qual = "*"
-            status = "good pairs from multiple both aligned"
+            status = "good pairs from multiple"
             return good_1, good_2, status
         
     def alignmentOutputPreprocess(self, lines_1, lines_2):
@@ -728,21 +728,17 @@ class Polyalign:
                 if status not in current_stats:
                     current_stats[status] = 0
                 current_stats[status] += 1
-        time_taken = time.time() - start_time
-        print("[PA::BCW]", len(chunk["list_1"]), "reads analysed in", round(time_taken, 3), "real sec")
-        print("[PA::BCW]", "Chunk", chunk["index"], "Stats:", ", ".join([x[0]+": "+str(x[1]) for x in current_stats.items()]))
-        start_time = time.time()
         output = PairFilter.alignmentOutputPreprocess(result_1, result_2)
-        time_taken = time.time() - start_time
-        print("[PA::PA]", "Chunk", chunk["index"], "output preprocessed in", round(time_taken, 3), "real sec")
         # return
+        chunk["time"]["process time"] = time.time() - start_time
         return {
             "output": output,
             "index": chunk["index"],
+            "time": chunk["time"],
             "stats": current_stats,
         }
 
-    def polyalign(self, mode="parallel"):
+    def polyalign(self, mode="parallel", chunk_length=1000):
         """
         Do the polyalignment.
         Aligns left and right reads separately, parsing output for all possible correct pairings.
@@ -779,12 +775,10 @@ class Polyalign:
         output.writeHeader(header_1, header_1)
         # alignment and filtering
         # set multiprocess parameters
-        chunk_length = 100000
+        chunk_reporting_interval = max(1, 100000//chunk_length)
         multiprocess_mode = "process"
         workers = self.python_workers
         if workers is None:
-            ## capped to 6 workers, as scaling tests 
-            #workers = min(multiprocessing.cpu_count(), 6)
             workers = multiprocessing.cpu_count()
         else:
             workers = min(max(1, workers), multiprocessing.cpu_count())
@@ -802,13 +796,14 @@ class Polyalign:
             Executor = concurrent.futures.ThreadPoolExecutor
         else:
             raise ValueError(f"Unknown multiprocess_mode '{multiprocess_mode}")
-        print("[PA::RBA]", "Workers:", workers, "Chunk length:", chunk_length, "Multiprocessing mode:", multiprocess_mode)
+        print("[PA::RBA]", "Workers:", workers, ", Chunk length:", chunk_length, ", Multiprocessing mode:", multiprocess_mode)
         # start execution
         # helper function for prepping a chunk
         def prep_chunk(index, sam_1, sam_2, chunk_length):
             start_time = time.time()
             chunk = {
                 "index": index,
+                "time": {},
                 "list_1": [],
                 "list_2": [],
                 "read_orientation": self.read_orientation,
@@ -822,8 +817,7 @@ class Polyalign:
                 if next_read_1 is not None and next_read_2 is not None:
                     chunk["list_1"].append(next_read_1)
                     chunk["list_2"].append(next_read_2)
-            time_taken = time.time() - start_time
-            print("[PA::PA]", "Chunk", index, "read in", round(time_taken, 3), "real sec")
+            chunk["time"]["read time"] = time.time() - start_time
             if len(chunk["list_1"]) > 0 and len(chunk["list_2"]) > 0:
                 return chunk
             else:
@@ -837,8 +831,10 @@ class Polyalign:
                     self.stats[status] = 0
                 self.stats[status] += result["stats"][status]
             output.writePreprocessed(result["output"])
-            time_taken = time.time() - start_time
-            print("[PA::PA]", "Chunk", result["index"], "output in", round(time_taken, 3), "real sec")
+            result["time"]["write time"] = time.time() - start_time
+            if result["index"]%chunk_reporting_interval == 0:
+                print("[PA::PA]", "Cumulative stats at chunk", str(result["index"])+":", ", ".join([x[0]+": "+str(x[1]) for x in self.stats.items()]))
+                print("[PA::PA]", "Performance on chunk", str(result["index"])+":", ", ".join([x[0]+": "+str(round(x[1], 5))+"s" for x in result["time"].items()]))
         # do analysis
         chunk_index = 0
         if workers > 1:
@@ -850,8 +846,8 @@ class Polyalign:
                 chunk = prep_chunk(chunk_index, sam_1, sam_2, chunk_length)
                 while chunk is not None and chunk_index < concurrent_chunks:
                     futures.append(executor.submit(self.batchChunkWorker, chunk=chunk))
-                    chunk = prep_chunk(chunk_index, sam_1, sam_2, chunk_length)
                     chunk_index += 1
+                    chunk = prep_chunk(chunk_index, sam_1, sam_2, chunk_length)
                 # as long as chunks can be assembled, start new chunks when tasks complete
                 while chunk is not None:
                     # check which chunks are complete
@@ -863,8 +859,8 @@ class Polyalign:
                     i = 0
                     while chunk is not None and i < len(complete):
                         futures.append(executor.submit(self.batchChunkWorker, chunk=chunk))
-                        chunk = prep_chunk(chunk_index, sam_1, sam_2, chunk_length)
                         chunk_index += 1
+                        chunk = prep_chunk(chunk_index, sam_1, sam_2, chunk_length)
                         i += 1
                     # handle output from completed chunks
                     for future_index in complete:
@@ -879,8 +875,8 @@ class Polyalign:
             chunk = prep_chunk(0, sam_1, sam_2, chunk_length)
             while chunk is not None:
                 handle_output(self.batchChunkWorker(chunk=chunk))
-                chunk = prep_chunk(chunk_index, sam_1, sam_2, chunk_length)
                 chunk_index += 1
+                chunk = prep_chunk(chunk_index, sam_1, sam_2, chunk_length)
         # end output
         output.closeOutput()
         print("[PA::PA]", "Stats:", ", ".join([x[0]+": "+str(x[1]) for x in self.stats.items()]))
