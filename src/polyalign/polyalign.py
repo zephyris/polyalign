@@ -750,11 +750,9 @@ class Polyalign:
         print("[PA::RBA]", "Workers:", workers, "Chunk length:", chunk_length, "Multiprocessing mode:", multiprocess_mode)
         # start execution
         # helper function for prepping a chunk
-        def iter_chunks(sam_1, sam_2, chunk_length):
-            index = itertools.count()
-            while True:
+        def prep_chunk(index, sam_1, sam_2, chunk_length):
                 chunk = {
-                    "index": next(index),
+                    "index": index,
                     "list_1": [],
                     "list_2": [],
                     "read_orientation": self.read_orientation,
@@ -768,9 +766,9 @@ class Polyalign:
                         chunk["list_1"].append(next_read_1)
                         chunk["list_2"].append(next_read_2)
                 if len(chunk["list_1"]) > 0 and len(chunk["list_2"]) > 0:
-                    yield chunk
+                    return chunk
                 else:
-                    break
+                    return None
         # helper function for handling output
         def handle_output(result):
             start_time = time.time()
@@ -781,20 +779,47 @@ class Polyalign:
             output.writeAlignment(result["result"][0], result["result"][1])
             end_time = time.time() - start_time
             print("[PA::PA]", "Chunk", result["index"], "output in", round(end_time, 3), "real sec")
+        # do analysis
+        chunk_index = 0
         if workers > 1:
             # fire up executor
             with Executor(workers) as executor:
-                futures = [
-                    executor.submit(self.batchChunkWorker, chunk=chunk)
-                    for chunk in iter_chunks(sam_1, sam_2, chunk_length)
-                ]
+                concurrent_chunks = workers * 2
+                futures = []
+                # start initial chunks, up to concurrent_chunks
+                chunk = prep_chunk(chunk_index, sam_1, sam_2, chunk_length)
+                while chunk is not None and chunk_index < concurrent_chunks:
+                    futures.append(executor.submit(self.batchChunkWorker, chunk=chunk))
+                    chunk = prep_chunk(chunk_index, sam_1, sam_2, chunk_length)
+                    chunk_index += 1
+                # as long as chunks can be assembled, start new chunks when tasks complete
+                while chunk is not None:
+                    # check which chunks are complete
+                    for future in range(len(futures)-1, -1, -1):
+                        if futures[future].done():
+                            complete.append(future_index)
+                    # submit that many new chunks
+                    i = 0
+                    while chunk is not None and i < len(complete):
+                        futures.append(executor.submit(self.batchChunkWorker, chunk=chunk))
+                        chunk = prep_chunk(chunk_index, sam_1, sam_2, chunk_length)
+                        chunk_index += 1
+                        i += 1
+                    # handle output from completed chunks
+                    for future_index in complete:
+                        future = futures.pop(future_index)
+                        handle_output(future.result())
+                    time.sleep(0.001)
                 # wait for all remaining futures to complete and handle output
                 for future in concurrent.futures.as_completed(futures):
                     handle_output(future.result())
         else:
             # single thread
-            for chunk in iter_chunks(sam_1, sam_2, chunk_length):
+            chunk = prep_chunk(0, sam_1, sam_2, chunk_length)
+            while chunk is not None:
                 handle_output(self.batchChunkWorker(chunk=chunk))
+                chunk = prep_chunk(chunk_index, sam_1, sam_2, chunk_length)
+                chunk_index += 1
         # end output
         output.closeOutput()
         print("[PA::PA]", "Stats:", ", ".join([x[0]+": "+str(x[1]) for x in self.stats.items()]))
