@@ -1,4 +1,5 @@
 from .polyalign import *
+import multiprocessing, math
 
 if __name__ == "__main__":
     def print_help():
@@ -22,8 +23,8 @@ if __name__ == "__main__":
             print_help()
             sys.exit(1)
     elif len(sys.argv) == 6:
-        polyalign = Polyalign(sys.argv[2], sys.argv[3], sys.argv[4], output_basename=sys.argv[5], output_type=sys.argv[1])
-        polyalign.polyalign(mode="serial")
+        polyalign = Polyalign(sys.argv[2], sys.argv[3], sys.argv[4], output_basename=sys.argv[5], output_type=sys.argv[1], python_workers=int(math.log2(multiprocessing.cpu_count())+1))
+        polyalign.polyalign()
     else:
         print_help()
         sys.exit(1)
