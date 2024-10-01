@@ -424,7 +424,8 @@ class AlignmentPair:
         return False
 
 class AlignmentPairFilter:
-    def __init__(self, read_orientation=None, insert_size_range=None, retain_unmapped=None, output_type=None):
+    def __init__(self, read_length=None, read_orientation=None, insert_size_range=None, retain_unmapped=None, output_type=None):
+        self.read_length = read_length
         self.read_orientation = read_orientation
         self.insert_size_range = insert_size_range
         self.retain_unmapped = retain_unmapped
@@ -464,9 +465,11 @@ class AlignmentPairFilter:
                 return True
         return False
     
-    def findGoodPairs(self, read_1, read_2):
+    def findGoodPairsNaive(self, read_1, read_2):
         """
         Find all good pairs of read_1 and read_2 alignments, pairs which align to the same reference, with the correct insert size, in the correct orientation
+        Naive implementation which exhaustively tests all combinations of read_1 and read_2, checking for same reference, correct insert size and correct orientation
+        Scales by len(read_1) * len(read_2)
         """
         good_1, good_2 = [False] * len(read_1), [False] * len(read_2)
         for index_1, alignment_1 in enumerate(read_1):
@@ -474,7 +477,72 @@ class AlignmentPairFilter:
                 if self.isGoodSinglePair([alignment_1], [alignment_2]):
                     good_1[index_1] = True
                     good_2[index_2] = True
-        return [read_1[index] for index, value in enumerate(good_1) if value], [read_2[index] for index, value in enumerate(good_2) if value]
+        result_1, result_2 = [read_1[index] for index, value in enumerate(good_1) if value], [read_2[index] for index, value in enumerate(good_2) if value]
+        result_1[0].seq, result_1[0].qual = read_1[0].seq, read_1[0].qual
+        result_2[0].seq, result_2[0].qual = read_2[0].seq, read_2[0].qual
+        return result_1, result_2
+    
+    def findGoodPairs(self, read_1, read_2):
+        """
+        Find all good pairs of read_1 and read_2 alignments, pairs which align to the same reference, with the correct insert size, in the correct orientation
+        Smartish implementation which should be much faster for repetitive genomes, by splitting reads by reference name and sorting by position
+        For each read_1, only checks read_2 pre-split to the correct reference and carefully stepping list indices to check within the potential good insert size range
+        """
+        def split_reads_by_rname(read):
+            dict = {}
+            for alignment in read:
+                if alignment.rname != "*":
+                    if alignment.rname not in dict:
+                        dict[alignment.rname] = []
+                    dict[alignment.rname].append(alignment)
+            return dict
+        
+        # setup output
+        result_1, result_2 = [], []
+        # check for no possible pairs
+        if len(read_1) == 0 or len(read_2) == 0:
+            return result_1, result_2
+        # good pairs must be aligned to the same reference, so start by splitting by rname
+        split_read_1 = split_reads_by_rname(read_1)
+        split_read_2 = split_reads_by_rname(read_2)
+        # search per reference
+        for rname in split_read_1:
+            # good pairs only possible on same reference
+            if rname not in split_read_2:
+                continue
+            # sort reads by increasing position on rname
+            split_read_1[rname].sort(key=lambda x: x.pos)
+            split_read_2[rname].sort(key=lambda x: x.pos)
+            # do smartish iteration through reads to find good pairs
+            good_1, good_2 = [False] * len(split_read_1[rname]), [False] * len(split_read_2[rname])
+            index_1, index_2 = 0, 0
+            while index_1 < len(split_read_1[rname]) and index_2 < len(split_read_2[rname]):
+                # first, increase index_2 until that read_2 is could be within the insert size range
+                while index_2 < len(split_read_2[rname]) and split_read_2[rname][index_2].pos + self.insert_size_range[1] + self.read_length < split_read_1[rname][index_1].pos:
+                    index_2 += 1
+                # if index_2 is now out of range, break
+                if index_2 >= len(split_read_2[rname]):
+                    break
+                # for each read_2 within the potential insert size range, check if it would be a good pair
+                cur_index_2 = index_2
+                while cur_index_2 < len(split_read_2[rname]) and split_read_2[rname][cur_index_2].pos - self.insert_size_range[1] - self.read_length < split_read_1[rname][index_1].pos:
+                    if self.isGoodSinglePair([split_read_1[rname][index_1]], [split_read_2[rname][cur_index_2]]):
+                        good_1[index_1], good_2[cur_index_2] = True, True
+                    cur_index_2 += 1
+                # increase index_1
+                index_1 += 1
+                # increase index_2 to the next read_2 not yet marked as part of a good pair
+                while index_2 < len(split_read_2[rname]) and good_2[index_2]:
+                    index_2 += 1
+            # add good pairs to output
+            result_1 += [split_read_1[rname][index] for index, value in enumerate(good_1) if value]
+            result_2 += [split_read_2[rname][index] for index, value in enumerate(good_2) if value]
+        # ensure that sequence and quality are set for first retained read
+        if len(result_1) > 0:
+            result_1[0].seq, result_1[0].qual = read_1[0].seq, read_1[0].qual
+        if len(result_2) > 0:
+            result_2[0].seq, result_2[0].qual = read_2[0].seq, read_2[0].qual
+        return result_1, result_2
 
     def analyseReadPairing(self, next_read_1, next_read_2):
         """
@@ -598,7 +666,7 @@ class Polyalign:
     Object to handle separate exhaustive bwa alignments of left and right reads.
     Estimates insert size and returns sam of only accepted best pairings.
     """
-    def __init__(self, subject_path, reads_1_path, reads_2_path, output_path=".", output_basename="polyalign", output_type="filtered", retain_unmapped=None, read_orientation=None, insert_size_range=None, bwa_options={}, do_bwa_indexing=True, bwa_workers=None, python_workers=None):
+    def __init__(self, subject_path, reads_1_path, reads_2_path, output_path=".", output_basename="polyalign", output_type="filtered", retain_unmapped=None, read_length=None, read_orientation=None, insert_size_range=None, bwa_options={}, do_bwa_indexing=True, bwa_workers=None, python_workers=None):
         self.subject_path = subject_path
         self.reads_1_path = reads_1_path
         self.reads_2_path = reads_2_path
@@ -614,9 +682,10 @@ class Polyalign:
         # initialise bwa mem
         self.bwa_mem = BwaMem(subject_path, bwa_options, do_indexing=do_bwa_indexing, cpus=bwa_workers)
         # set read orientation and insert size, fetching automatically if necessary
+        self.read_length = read_length
         self.read_orientation = read_orientation
         self.insert_size_range = insert_size_range
-        if self.read_orientation is None or self.insert_size_range is None:
+        if self.read_length is None or self.read_orientation is None or self.insert_size_range is None:
             self.estimateInsertSizeRange()
         self.retain_unmapped = retain_unmapped
         if self.retain_unmapped is None and output_type == "paired":
@@ -704,6 +773,8 @@ class Polyalign:
             self.read_orientation = max(orientation, key=orientation.get)
         if self.insert_size_range is None:
             self.insert_size_range = (insert_lower, insert_upper)
+        if self.read_length is None:
+            self.read_length = read_length
         # remove temporary files
         os.remove("tmp1.fastq.tmp")
         os.remove("tmp2.fastq.tmp")
@@ -717,7 +788,7 @@ class Polyalign:
         chunk["list_1"] = [[Alignment(line) for line in read] for read in chunk["list_1"]]
         chunk["list_2"] = [[Alignment(line) for line in read] for read in chunk["list_2"]]
         # do filtering
-        PairFilter = AlignmentPairFilter(chunk["read_orientation"], chunk["insert_size_range"], chunk["retain_unmapped"], chunk["output_type"])
+        PairFilter = AlignmentPairFilter(chunk["read_length"], chunk["read_orientation"], chunk["insert_size_range"], chunk["retain_unmapped"], chunk["output_type"])
         current_stats = {}
         result_1, result_2 = [], []
         for index in range(len(chunk["list_1"])):
@@ -806,6 +877,7 @@ class Polyalign:
                 "time": {},
                 "list_1": [],
                 "list_2": [],
+                "read_length": self.read_length,
                 "read_orientation": self.read_orientation,
                 "insert_size_range": self.insert_size_range,
                 "retain_unmapped": self.retain_unmapped,
