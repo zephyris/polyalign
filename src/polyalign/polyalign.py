@@ -1,4 +1,4 @@
-import os, sys, subprocess, multiprocessing, concurrent.futures, time, random
+import os, sys, subprocess, multiprocessing, concurrent.futures, time, random, copy, itertools
 import functools
 from tqdm.auto import tqdm
 
@@ -116,7 +116,7 @@ class BwaMem:
             lines = [line.copy()]
             while next(self) is not None and self.current[0][0] == "@":
                 lines.append(self.current.copy())
-            return [Header(line) for line in lines]
+            return lines
         
         def nextRead(self):
             """
@@ -129,7 +129,7 @@ class BwaMem:
             lines = [line.copy()]
             while next(self) is not None and lines[0][0]==self.current_id:
                 lines.append(self.current.copy())
-            return [Alignment(line) for line in lines]
+            return lines
     
     def mem(self, reads_1_path, reads_2_path=None):
         """
@@ -424,39 +424,14 @@ class AlignmentPair:
             return True
         return False
 
-
-
-class Polyalign:
-    """
-    Object to handle separate exhaustive bwa alignments of left and right reads.
-    Estimates insert size and returns sam of only accepted best pairings.
-    """
-    def __init__(self, subject_path, reads_1_path, reads_2_path, output_path=".", output_basename="polyalign", output_type="filtered", retain_unmapped=None, read_orientation=None, insert_size_range=None, bwa_options={}, do_bwa_indexing=True, bwa_workers=None, python_workers=None):
-        self.subject_path = subject_path
-        self.reads_1_path = reads_1_path
-        self.reads_2_path = reads_2_path
-        self.output_path = output_path
-        self.output_basename = output_basename
-        self.output_type = output_type
-        # set workers
-        self.bwa_workers = bwa_workers
-        self.python_workers = python_workers
-        # set necessary bwa options, -a and -Y flags
-        bwa_options["a"] = None
-        bwa_options["Y"] = None
-        # initialise bwa mem
-        self.bwa_mem = BwaMem(subject_path, bwa_options, do_indexing=do_bwa_indexing, cpus=bwa_workers)
-        # set read orientation and insert size, fetching automatically if necessary
+class AlignmentPairFilter:
+    def __init__(self, read_length=None, read_orientation=None, insert_size_range=None, retain_unmapped=None, output_type=None):
+        self.read_length = read_length
         self.read_orientation = read_orientation
         self.insert_size_range = insert_size_range
-        if self.read_orientation is None or self.insert_size_range is None:
-            self.estimateInsertSizeRange()
         self.retain_unmapped = retain_unmapped
-        if self.retain_unmapped is None and output_type == "paired":
-            self.retain_unmapped = False
-        else:
-            self.retain_unmapped = True
-
+        self.output_type = output_type
+    
     def isSinglePair(self, read_1, read_2):
         """
         Check if read_1 and read_2 have length 1, ie. single alignment of paired reads
@@ -491,9 +466,11 @@ class Polyalign:
                 return True
         return False
     
-    def findGoodPairs(self, read_1, read_2):
+    def findGoodPairsNaive(self, read_1, read_2):
         """
         Find all good pairs of read_1 and read_2 alignments, pairs which align to the same reference, with the correct insert size, in the correct orientation
+        Naive implementation which exhaustively tests all combinations of read_1 and read_2, checking for same reference, correct insert size and correct orientation
+        Scales by len(read_1) * len(read_2)
         """
         good_1, good_2 = [False] * len(read_1), [False] * len(read_2)
         for index_1, alignment_1 in enumerate(read_1):
@@ -501,8 +478,222 @@ class Polyalign:
                 if self.isGoodSinglePair([alignment_1], [alignment_2]):
                     good_1[index_1] = True
                     good_2[index_2] = True
-        return [read_1[index] for index, value in enumerate(good_1) if value], [read_2[index] for index, value in enumerate(good_2) if value]
+        result_1, result_2 = [read_1[index] for index, value in enumerate(good_1) if value], [read_2[index] for index, value in enumerate(good_2) if value]
+        result_1[0].seq, result_1[0].qual = read_1[0].seq, read_1[0].qual
+        result_2[0].seq, result_2[0].qual = read_2[0].seq, read_2[0].qual
+        return result_1, result_2
     
+    def findGoodPairs(self, read_1, read_2):
+        """
+        Find all good pairs of read_1 and read_2 alignments, pairs which align to the same reference, with the correct insert size, in the correct orientation
+        Smartish implementation which should be much faster for repetitive genomes, by splitting reads by reference name and sorting by position
+        For each read_1, only checks read_2 pre-split to the correct reference and carefully stepping list indices to check within the potential good insert size range
+        """
+        def split_reads_by_rname(read):
+            dict = {}
+            for alignment in read:
+                if alignment.rname != "*":
+                    if alignment.rname not in dict:
+                        dict[alignment.rname] = []
+                    dict[alignment.rname].append(alignment)
+            return dict
+        
+        # setup output
+        result_1, result_2 = [], []
+        # check for no possible pairs
+        if len(read_1) == 0 or len(read_2) == 0:
+            return result_1, result_2
+        # good pairs must be aligned to the same reference, so start by splitting by rname
+        split_read_1 = split_reads_by_rname(read_1)
+        split_read_2 = split_reads_by_rname(read_2)
+        # search per reference
+        for rname in split_read_1:
+            # good pairs only possible on same reference
+            if rname not in split_read_2:
+                continue
+            # sort reads by increasing position on rname
+            split_read_1[rname].sort(key=lambda x: x.pos)
+            split_read_2[rname].sort(key=lambda x: x.pos)
+            # do smartish iteration through reads to find good pairs
+            good_1, good_2 = [False] * len(split_read_1[rname]), [False] * len(split_read_2[rname])
+            index_1, index_2 = 0, 0
+            while index_1 < len(split_read_1[rname]) and index_2 < len(split_read_2[rname]):
+                # first, increase index_2 until that read_2 is could be within the insert size range
+                while index_2 < len(split_read_2[rname]) and split_read_2[rname][index_2].pos + self.insert_size_range[1] + self.read_length < split_read_1[rname][index_1].pos:
+                    index_2 += 1
+                # if index_2 is now out of range, break
+                if index_2 >= len(split_read_2[rname]):
+                    break
+                # for each read_2 within the potential insert size range, check if it would be a good pair
+                cur_index_2 = index_2
+                while cur_index_2 < len(split_read_2[rname]) and split_read_2[rname][cur_index_2].pos - self.insert_size_range[1] - self.read_length < split_read_1[rname][index_1].pos:
+                    if self.isGoodSinglePair([split_read_1[rname][index_1]], [split_read_2[rname][cur_index_2]]):
+                        good_1[index_1], good_2[cur_index_2] = True, True
+                    cur_index_2 += 1
+                # increase index_1
+                index_1 += 1
+                # increase index_2 to the next read_2 not yet marked as part of a good pair
+                while index_2 < len(split_read_2[rname]) and good_2[index_2]:
+                    index_2 += 1
+            # add good pairs to output
+            result_1 += [split_read_1[rname][index] for index, value in enumerate(good_1) if value]
+            result_2 += [split_read_2[rname][index] for index, value in enumerate(good_2) if value]
+        # ensure that sequence and quality are set for first retained read
+        if len(result_1) > 0:
+            result_1[0].seq, result_1[0].qual = read_1[0].seq, read_1[0].qual
+        if len(result_2) > 0:
+            result_2[0].seq, result_2[0].qual = read_2[0].seq, read_2[0].qual
+        return result_1, result_2
+
+    def analyseReadPairing(self, next_read_1, next_read_2):
+        """
+        Read input sams, check for read alignment and return correctly paired reads.
+        Aims to copy Polypolish filtering: https://github.com/rrwick/Polypolish/blob/main/src/filter.rs alignment_pass_qc()
+        """
+        # no next read, return None
+        if next_read_1 is None or next_read_2 is None:
+            status = None
+            return None, None, status
+        # TODO: More consistent handling of read retention/discard, eg. just pop from list if not retained, and add support for setting ZP:Z:fail flag
+        # check for read name mismatch
+        if next_read_1[0].qname != next_read_2[0].qname:
+            print("[PA::ARP]", "Error: Read names do not match")
+        # check for no alignments
+        if self.isUnalignedPair(next_read_1, next_read_2):
+            # For pairs where both have zero alignments, retain sam lines, but no way to contribute to polishing.
+            status = "both unaligned"
+            next_read_1[0].setOptional("ZP", "fail", "Z")
+            next_read_2[0].setOptional("ZP", "fail", "Z")
+            if self.retain_unmapped:
+                return next_read_1, next_read_2, status
+            return [], [], status
+        if self.isOneUnalignedPair(next_read_1, next_read_2):
+            # For pairs with exactly one alignment of each read, keep sam lines, ie. treat unique paired alignments as correct.
+            status = "single unaligned"
+            return next_read_1, next_read_2, status
+        if self.isSinglePair(next_read_1, next_read_2):
+            # For pairs where one has zero alignments, keep sam lines, ie. treat single alignments as correct.
+            status = "both unique aligned"
+            return next_read_1, next_read_2, status
+        # For pairs with multiple alignments, keep sam lines if it pairs (same ref seq, correct ori, good insert) with any of its pair's alignments.
+        good_1, good_2 = self.findGoodPairs(next_read_1, next_read_2)
+        if self.retain_unmapped:
+            # Keep all read alignments, but mark as failed
+            for read_1 in next_read_1:
+                if read_1 not in good_1:
+                    read_1.setOptional("ZP", "fail", "Z")
+            for read_2 in next_read_2:
+                if read_2 not in good_2:
+                    read_2.setOptional("ZP", "fail", "Z")
+            if len(good_1) == 0 or len(good_2) == 0:
+                status = "no good pairs from multiple"
+            else:
+                status = "good pairs from multiple"
+            return next_read_1, next_read_2, status
+        else:
+            # keep only good read alignments
+            if len(good_1) == 0 or len(good_2) == 0:
+                status = "no good pairs from multiple"
+                return [], [], status
+            for index, good in enumerate(good_1):
+                # add sequence and quality to first good reads, replace with "*" for the rest
+                if index == 0:
+                    good.seq = next_read_1[0].seq
+                    good.qual = next_read_1[0].qual
+                else:
+                    good.seq = "*"
+                    good.qual = "*"
+            for index, good in enumerate(good_2):
+                if index == 0:
+                    good.seq = next_read_2[0].seq
+                    good.qual = next_read_1[0].qual
+                else:
+                    good.seq = "*"
+                    good.qual = "*"
+            status = "good pairs from multiple"
+            return good_1, good_2, status
+        
+    def alignmentOutputPreprocess(self, lines_1, lines_2):
+        """
+        Prepare alignment lines for output based on output type
+        """
+        if self.output_type == "filtered":
+            output = [[], []]
+            for l in range(len(lines_1)):
+                output[0] += [str(line) for line in lines_1[l]]
+                output[1] += [str(line) for line in lines_2[l]]
+            return output
+        if self.output_type == "paired":
+            output = [[]]
+            for l in range(len(lines_1)):
+                # for each read pair
+                if len(lines_1[l]) > 0 and len(lines_2[l]) > 0:
+                    # pick a random pair if multiple alignments, ensuring sequence data is included
+                    if len(lines_1[l]) > 1 or len(lines_2[l]) > 1:
+                        out_1, out_2 = random.choice(lines_1[l]), random.choice(lines_2[l])
+                        out_1.seq, out_1.qual = lines_1[l][0].seq, lines_1[l][0].qual
+                        out_2.seq, out_2.qual = lines_2[l][0].seq, lines_2[l][0].qual
+                        lines_1[l], lines_2[l] = [out_1], [out_2]
+                    # set pairing information
+                    lines_1[l][0].rnext, lines_2[l][0].rnext = lines_2[l][0].rname, lines_1[l][0].rname
+                    lines_1[l][0].pnext, lines_2[l][0].pnext = lines_2[l][0].pos, lines_1[l][0].pos
+                    output[0].append(str(lines_1[l][0]))
+                    output[0].append(str(lines_2[l][0]))
+            return output
+        if self.output_type == "splitfiltered" or self.output_type == "filtered":
+            output = [{}, {}]
+            lines = [lines_1, lines_2]
+            for dir in range(len(lines)):
+                # for left and right read
+                for l in range(len(lines[dir])):
+                    # for each read
+                    out_rnames = [] # each reference aligned to, so far
+                    for a in range(len(lines[dir][l])):
+                        # for each alignment
+                        rname = lines[dir][l][a].rname
+                        if rname != "*": # only write to buffer if reference is not *, ie. unaligned sequcence
+                            if rname not in out_rnames:
+                                # first alignment to this reference, so infill sequence data
+                                out_rnames.append(rname)
+                                lines[dir][l][a].seq, lines[dir][l][a].qual = lines[dir][l][0].seq, lines[dir][l][0].qual
+                            # append to buffer
+                            if rname not in output[dir]:
+                                output[dir][rname] = []
+                            output[dir][rname].append(str(lines[dir][l][a]))
+            return output
+
+class Polyalign:
+    """
+    Object to handle separate exhaustive bwa alignments of left and right reads.
+    Estimates insert size and returns sam of only accepted best pairings.
+    """
+    def __init__(self, subject_path, reads_1_path, reads_2_path, output_path=".", output_basename="polyalign", output_type="filtered", retain_unmapped=None, read_length=None, read_orientation=None, insert_size_range=None, bwa_options={}, do_bwa_indexing=True, bwa_workers=None, python_workers=None):
+        self.subject_path = subject_path
+        self.reads_1_path = reads_1_path
+        self.reads_2_path = reads_2_path
+        self.output_path = output_path
+        self.output_basename = output_basename
+        self.output_type = output_type
+        # set workers
+        self.bwa_workers = bwa_workers
+        self.python_workers = python_workers
+        # set necessary bwa options, -a and -Y flags
+        bwa_options["a"] = None
+        bwa_options["Y"] = None
+        # initialise bwa mem
+        self.bwa_mem = BwaMem(subject_path, bwa_options, do_indexing=do_bwa_indexing, cpus=bwa_workers)
+        # set read orientation and insert size, fetching automatically if necessary
+        self.read_length = read_length
+        self.read_orientation = read_orientation
+        self.insert_size_range = insert_size_range
+        if self.read_length is None or self.read_orientation is None or self.insert_size_range is None:
+            self.estimateInsertSizeRange()
+        self.retain_unmapped = retain_unmapped
+        if self.retain_unmapped is None and output_type == "paired":
+            self.retain_unmapped = False
+        else:
+            self.retain_unmapped = True
+
     def estimateInsertSizeRange(self, read_sample = 100000, insert_size_percentile = 0.01):
         """
         Using a sample of read_sample reads, estimate insert size distribution.
@@ -540,10 +731,17 @@ class Polyalign:
         # iterate through sets of alignment for each read
         next_read_1 = sam_1.nextRead()
         next_read_2 = sam_2.nextRead()
-        while next_read_1 is not None:
+        PairFilter = AlignmentPairFilter()
+        while next_read_1 is not None and next_read_2 is not None:
+            next_read_1 = [Alignment(line) for line in next_read_1]
+            next_read_2 = [Alignment(line) for line in next_read_2]
+            # check for read name matching errors
+            if next_read_1[0].qname != next_read_2[0].qname:
+                print("[PA::EISR]", "Error: Read names do not match")
+                raise ValueError("Read names do not match, are the reads the same order in the two FASTQ files?")
             # if a single pair
-            if self.isSinglePair(next_read_1, next_read_2):
-                # get and record statsenumerate
+            if PairFilter.isSinglePair(next_read_1, next_read_2):
+                # get and record stats
                 read_pair = AlignmentPair(next_read_1[0], next_read_2[0])
                 if read_pair.sameReference():
                     insert_size.append(read_pair.insertSize())
@@ -556,11 +754,16 @@ class Polyalign:
         insert_lower = insert_size[int(len(insert_size) * insert_size_percentile)]
         insert_upper = insert_size[int(len(insert_size) * (1 - insert_size_percentile))]
         read_length = sum(read_length) // len(read_length)
-        #if insert_lower >= insert_upper or insert_lower < read_length:
-        #    print("[PA::EISR]", "Error: Insert size range is invalid")
-        #    print("[PA::EISR]", "Read length:", read_length)
-        #    print("[PA::EISR]", "Insert size range:", insert_lower, insert_upper)
-        #    raise ValueError("Insert size range is invalid")
+        if len(insert_size) == 0:
+            print("[PA::EISR]", "Error: No valid pairs found from " + str(read_sample) + " sampled reads")
+            raise ValueError("No valid pairs found")
+        if len(insert_size) < read_sample / 2:
+            print("[PA::EISR]", "Warning: Fewer than 50% of reads have valid pairs")
+        if insert_lower >= insert_upper or insert_lower < read_length:
+            print("[PA::EISR]", "Error: Insert size range is invalid")
+            print("[PA::EISR]", "Read length:", read_length)
+            print("[PA::EISR]", "Insert size range:", insert_lower, insert_upper)
+            raise ValueError("Insert size range is invalid")
         # print result
         print("[PA::EISR]", "Result:")
         print("[PA::EISR]", "Read length:", read_length)
@@ -571,100 +774,43 @@ class Polyalign:
             self.read_orientation = max(orientation, key=orientation.get)
         if self.insert_size_range is None:
             self.insert_size_range = (insert_lower, insert_upper)
+        if self.read_length is None:
+            self.read_length = read_length
         # remove temporary files
         os.remove("tmp1.fastq.tmp")
         os.remove("tmp2.fastq.tmp")
 
-    def analyseReadPairing(self, next_read_1, next_read_2):
+    def batchChunkWorker(self, chunk):
         """
-        Read input sams, check for read alignment and return correctly paired reads.
-        Aims to copy Polypolish filtering: https://github.com/rrwick/Polypolish/blob/main/src/filter.rs alignment_pass_qc()
+        Run pairing analysis on list of reads
         """
-        # no next read, return None
-        if next_read_1 is None or next_read_2 is None:
-            status = None
-            return None, None, status
-        # TODO: More consistent handling of read retention/discard, eg. just pop from list if not retained, and add support for setting ZP:Z:fail flag
-        # check for read name mismatch
-        if next_read_1[0].qname != next_read_2[0].qname:
-            print("[PA::ARP]", "Error: Read names do not match")
-        # check for no alignments
-        if self.isUnalignedPair(next_read_1, next_read_2):
-            # For pairs where both have zero alignments, retain sam lines, but no way to contribute to polishing.
-            status = "both unaligned"
-            next_read_1[0].setOptional("ZP", "fail", "Z")
-            next_read_2[0].setOptional("ZP", "fail", "Z")
-            if self.retain_unmapped:
-                return next_read_1, next_read_2, status
-            return [], [], status
-        if self.isOneUnalignedPair(next_read_1, next_read_2):
-            # For pairs with exactly one alignment of each read, keep sam lines, ie. treat unique paired alignments as correct.
-            status = "single unaligned"
-            return next_read_1, next_read_2, status
-        if self.isSinglePair(next_read_1, next_read_2):
-            # For pairs where one has zero alignments, keep sam lines, ie. treat single alignments as correct.
-            status = "unique both aligned"
-            return next_read_1, next_read_2, status
-        # For pairs with multiple alignments, keep sam lines if it pairs (same ref seq, correct ori, good insert) with any of its pair's alignments.
-        good_1, good_2 = self.findGoodPairs(next_read_1, next_read_2)
-        if self.retain_unmapped:
-            # Keep all read alignments, but mark as failed
-            for read_1 in next_read_1:
-                if read_1 not in good_1:
-                    read_1.setOptional("ZP", "fail", "Z")
-            for read_2 in next_read_2:
-                if read_2 not in good_2:
-                    read_2.setOptional("ZP", "fail", "Z")
-            if len(good_1) == 0 or len(good_2) == 0:
-                status = "no good pairs from multiple both aligned"
-            else:
-                status = "good pairs from multiple both aligned"
-            return next_read_1, next_read_2, status
-        else:
-            # keep only good read alignments
-            if len(good_1) == 0 or len(good_2) == 0:
-                status = "no good pairs from multiple both aligned"
-                return [], [], status
-            for index, good in enumerate(good_1):
-                # add sequence and quality to first good reads, replace with "*" for the rest
-                if index == 0:
-                    good.seq = next_read_1[0].seq
-                    good.qual = next_read_1[0].qual
-                else:
-                    good.seq = "*"
-                    good.qual = "*"
-            for index, good in enumerate(good_2):
-                if index == 0:
-                    good.seq = next_read_2[0].seq
-                    good.qual = next_read_1[0].qual
-                else:
-                    good.seq = "*"
-                    good.qual = "*"
-            status = "good pairs from multiple both aligned"
-            return good_1, good_2, status
-
-    def batchChunkWorker(self, chunk=None):
-        """
-        Run analysis_function on list of reads, using multiprocessing or multithreading
-        """
+        start_time = time.time()
+        # parse lines as alignments
+        chunk["list_1"] = [[Alignment(line) for line in read] for read in chunk["list_1"]]
+        chunk["list_2"] = [[Alignment(line) for line in read] for read in chunk["list_2"]]
+        # do filtering
+        PairFilter = AlignmentPairFilter(chunk["read_length"], chunk["read_orientation"], chunk["insert_size_range"], chunk["retain_unmapped"], chunk["output_type"])
         current_stats = {}
         result_1, result_2 = [], []
         for index in range(len(chunk["list_1"])):
-            curr_result_1, curr_result_2, status = self.analyseReadPairing(chunk["list_1"][index], chunk["list_2"][index])
+            curr_result_1, curr_result_2, status = PairFilter.analyseReadPairing(chunk["list_1"][index], chunk["list_2"][index])
             if curr_result_1 is not None and curr_result_2 is not None and status is not None:
                 result_1.append(curr_result_1)
                 result_2.append(curr_result_2)
                 if status not in current_stats:
                     current_stats[status] = 0
                 current_stats[status] += 1
-        result = {
+        output = PairFilter.alignmentOutputPreprocess(result_1, result_2)
+        # return
+        chunk["time"]["process time"] = time.time() - start_time
+        return {
+            "output": output,
             "index": chunk["index"],
-            "chunk": (result_1, result_2),
-            "stats": current_stats
+            "time": chunk["time"],
+            "stats": current_stats,
         }
-        return result
 
-    def polyalign(self, mode="parallel"):
+    def polyalign(self, mode="parallel", chunk_length=1000):
         """
         Do the polyalignment.
         Aligns left and right reads separately, parsing output for all possible correct pairings.
@@ -676,70 +822,10 @@ class Polyalign:
             command = sys.argv.copy()
             command[0] = os.path.basename(command[0])
             program_line = Header(["@PG", "ID:polyalign", "PN:polyalign", "VN:0.0.0", "CL:"+" ".join(command)])
-            return sam_1.readHeader() + [program_line], sam_2.readHeader() + [program_line]
-
-        def readBatchAnalysis(chunk_length=100000, chunks_per_worker=3, multiprocess_mode="thread", workers=None):
-            """
-            Run analysis_function on list of reads, return processed list
-            """
-            # set number of workers
-            if workers is None:
-                workers = multiprocessing.cpu_count()
-            else:
-                workers = min(max(1, workers), multiprocessing.cpu_count())
-            print("[PA::RBA]", "Workers:", workers, "Chunks per worker:", chunks_per_worker, "Chunk length:", chunk_length, "Multiprocessing mode:", multiprocess_mode)
-            # setup multiprocessing mode
-            if multiprocess_mode is None:
-                # run in a single thread, still use the ThreadPoolExecutor since that's equivalent
-                #print("[PA::RBA]", "Single thread")
-                Executor = concurrent.futures.ThreadPoolExecutor
-                workers = 1
-            elif multiprocess_mode == "process":
-                #print("[PA::RBA]", "Parallel processes with", workers, "workers")
-                # setup executor as a process pool
-                Executor = concurrent.futures.ProcessPoolExecutor
-            elif multiprocess_mode == "thread":
-                # setup executor as a thread pool
-                #print("[PA::RBA]", "Parallel threads with", workers, "workers")
-                Executor = concurrent.futures.ThreadPoolExecutor
-            else:
-                raise ValueError(f"Unknown multiprocess_mode '{multiprocess_mode}")
-            # fetch data for worklist
-            list_chunks = []
-            for i in range(workers * chunks_per_worker):
-                list_chunks.append({"index": i, "list_1": [], "list_2": []})
-                for j in range(chunk_length):
-                    next_read_1 = sam_1.nextRead()
-                    next_read_2 = sam_2.nextRead()
-                    if next_read_1 is not None and next_read_2 is not None:
-                        list_chunks[i]["list_1"].append(next_read_1)
-                        list_chunks[i]["list_2"].append(next_read_2)
-            start_time = time.time()
-            print("[PA::RBA]", "Analysing read pairing,", len(list_chunks), "chunks of", len(list_chunks[0]["list_1"]), "read pairs with", workers, "workers")
-            # fire up executor
-            with Executor(workers) as executor:
-                futures = [executor.submit(self.batchChunkWorker, chunk=chunk) for chunk in list_chunks]
-                results = [future.result() for future in tqdm(concurrent.futures.as_completed(futures), total=len(futures), smoothing=0, disable=True)]
-            # reconstruct stats
-            for result in results:
-                for key in result["stats"]:
-                    if key not in self.stats:
-                        self.stats[key] = 0
-                    self.stats[key] += result["stats"][key]
-            # sort by chunk index and reconstruct results
-            results.sort(key=lambda x: x["index"])
-            result_1, result_2 = [], []
-            for result in results:
-                result_1 += result["chunk"][0]
-                result_2 += result["chunk"][1]
-            # time taken
-            time_taken = time.time() - start_time
-            print("[PA::RBA]", sum([len(x["list_1"]) for x in list_chunks]), "reads analysed in", round(time_taken * workers, 3), "CPU sec,", round(time_taken, 3), "real sec")
-            return (result_1, result_2)
+            return [Header(line) for line in sam_1.readHeader()] + [program_line], [Header(line) for line in sam_2.readHeader()] + [program_line]
 
         print("[PA::PA]", "Polyaligning in", self.output_type, "mode")
         # set mode
-        mode = "parallel"
         if mode is None:
             mode = "parallel"
         if mode not in ["serial", "parallel"]:
@@ -760,37 +846,121 @@ class Polyalign:
         header_1, header_2 = returnHeader()
         output.writeHeader(header_1, header_1)
         # alignment and filtering
-        if mode == "parallel":
-            results = readBatchAnalysis(workers=self.python_workers)
-            while len(results[0]) > 0 and len(results[1]) > 0:
-                print("[PA::PA]", "Stats:", ", ".join([x[0]+": "+str(x[1]) for x in self.stats.items()]))
-                output.writeAlignment(results[0], results[1])
-                results = readBatchAnalysis(workers=self.python_workers)
-        elif mode == "serial":
-            next_read_1 = sam_1.nextRead()
-            next_read_2 = sam_2.nextRead()
-            alignment_1, alignment_2, status = self.analyseReadPairing(next_read_1, next_read_2)
-            while alignment_1 is not None and alignment_2 is not None:
-                read_index += 1
-                if status is not None:
-                    if status not in self.stats:
-                        self.stats[status] = 0
-                    self.stats[status] += 1
-                if read_index % 100000 == 0:
-                    print("[PA::PA]", "Stats:", ", ".join([x[0]+": "+str(x[1]) for x in self.stats.items()]))
-                output.writeAlignment([alignment_1], [alignment_2])
-                alignment_1, alignment_2, status = self.analyseReadPairing(next_read_1, next_read_2)
+        # set multiprocess parameters
+        chunk_reporting_interval = max(1, 100000//chunk_length)
+        multiprocess_mode = "process"
+        workers = self.python_workers
+        if workers is None:
+            workers = multiprocessing.cpu_count()
+        else:
+            workers = min(max(1, workers), multiprocessing.cpu_count())
+        if mode == "serial" or workers == 1:
+            multiprocess_mode = None
+            workers = 1
+        # setup executor for multiprocessing mode
+        if multiprocess_mode is None:
+            # run in a single thread, single ThreadPoolExecutor is equivalent to simple ongoing script
+            Executor = concurrent.futures.ThreadPoolExecutor
+            workers = 1
+        elif multiprocess_mode == "process":
+            Executor = concurrent.futures.ProcessPoolExecutor
+        elif multiprocess_mode == "thread":
+            Executor = concurrent.futures.ThreadPoolExecutor
+        else:
+            raise ValueError(f"Unknown multiprocess_mode '{multiprocess_mode}")
+        print("[PA::RBA]", "Workers:", workers, ", Chunk length:", chunk_length, ", Multiprocessing mode:", multiprocess_mode)
+        # start execution
+        # helper function for prepping a chunk
+        def prep_chunk(index, sam_1, sam_2, chunk_length):
+            start_time = time.time()
+            chunk = {
+                "index": index,
+                "time": {},
+                "list_1": [],
+                "list_2": [],
+                "read_length": self.read_length,
+                "read_orientation": self.read_orientation,
+                "insert_size_range": self.insert_size_range,
+                "retain_unmapped": self.retain_unmapped,
+                "output_type": self.output_type,
+            }
+            for _ in range(chunk_length):
+                next_read_1 = sam_1.nextRead()
+                next_read_2 = sam_2.nextRead()
+                if next_read_1 is not None and next_read_2 is not None:
+                    chunk["list_1"].append(next_read_1)
+                    chunk["list_2"].append(next_read_2)
+            chunk["time"]["read time"] = time.time() - start_time
+            if len(chunk["list_1"]) > 0 and len(chunk["list_2"]) > 0:
+                return chunk
+            else:
+                print("[PA::PA]", "End of bwa mem output reached")
+                return None
+        # helper function for handling output
+        def handle_output(result):
+            start_time = time.time()
+            for status in result["stats"]:
+                if status not in self.stats:
+                    self.stats[status] = 0
+                self.stats[status] += result["stats"][status]
+            output.writePreprocessed(result["output"])
+            result["time"]["write time"] = time.time() - start_time
+            if result["index"]%chunk_reporting_interval == 0:
+                print("[PA::PA]", "Cumulative stats at chunk", str(result["index"])+":", ", ".join([x[0]+": "+str(x[1]) for x in self.stats.items()]))
+                print("[PA::PA]", "Performance on chunk", str(result["index"])+":", ", ".join([x[0]+": "+str(round(x[1], 5))+"s" for x in result["time"].items()]))
+        # do analysis
+        chunk_index = 0
+        if workers > 1:
+            # fire up executor
+            with Executor(workers) as executor:
+                concurrent_chunks = workers * 2
+                futures = []
+                # start initial chunks, up to concurrent_chunks
+                chunk = prep_chunk(chunk_index, sam_1, sam_2, chunk_length)
+                while chunk is not None and chunk_index < concurrent_chunks:
+                    futures.append(executor.submit(self.batchChunkWorker, chunk=chunk))
+                    chunk_index += 1
+                    chunk = prep_chunk(chunk_index, sam_1, sam_2, chunk_length)
+                # as long as chunks can be assembled, start new chunks when tasks complete
+                while chunk is not None:
+                    # check which chunks are complete
+                    complete = []
+                    for future_index in range(len(futures)-1, -1, -1):
+                        if futures[future_index].done():
+                            complete.append(future_index)
+                    # submit that many new chunks
+                    i = 0
+                    while chunk is not None and i < len(complete):
+                        futures.append(executor.submit(self.batchChunkWorker, chunk=chunk))
+                        chunk_index += 1
+                        chunk = prep_chunk(chunk_index, sam_1, sam_2, chunk_length)
+                        i += 1
+                    # handle output from completed chunks
+                    for future_index in complete:
+                        future = futures.pop(future_index)
+                        handle_output(future.result())
+                    time.sleep(0.001)
+                # wait for all remaining futures to complete and handle output
+                for future in concurrent.futures.as_completed(futures):
+                    handle_output(future.result())
+        else:
+            # single thread
+            chunk = prep_chunk(0, sam_1, sam_2, chunk_length)
+            while chunk is not None:
+                handle_output(self.batchChunkWorker(chunk=chunk))
+                chunk_index += 1
+                chunk = prep_chunk(chunk_index, sam_1, sam_2, chunk_length)
         # end output
         output.closeOutput()
-        print("[PA::PA]", "End of bwa mem output reached")
-        print("[PA::PA]", "Final stats:", ", ".join([x[0]+": "+str(x[1]) for x in self.stats.items()]))
+        print("[PA::PA]", "Stats:", ", ".join([x[0]+": "+str(x[1]) for x in self.stats.items()]))
         print("[PA::PA]", "Polyaligning complete")
 
 class Output:
-    def __init__(self, base_name, output_mode, base_path):
+    def __init__(self, base_name, output_mode, base_path, append_output=False):
         self.base_path = base_path
         self.base_name = base_name
         self.output_mode = output_mode
+        self.append_output = append_output # whether to remove existing output (False) files or happily append (True)
         self.soft_file_limit = None
         output_modes = ["filtered", "paired", "splitfiltered"]
         if self.output_mode not in output_modes:
@@ -801,19 +971,32 @@ class Output:
         print("[PA::OP]", "Output mode:", self.output_mode, "Base name:", self.base_name, "Base path:", self.base_path)
 
     def setupOutput(self):
+        # setup output files
+        mode = "w"
+        if self.append_output:
+            mode = "a"
         if self.base_name == "-":
             print("[PA::OP]", "Outputting to stdout")
             return [sys.stdout]
         if self.output_mode == "paired":
             print("[PA::OP]", "Output file:", self.base_name+".sam")
-            return [open(os.path.join(self.base_path, self.base_name + ".sam"), "w")]
+            if not self.append_output:
+                if os.path.exists(os.path.join(self.base_path, self.base_name+".sam")):
+                    os.remove(os.path.join(self.base_path, self.base_name+".sam"))
+            return [open(os.path.join(self.base_path, self.base_name + ".sam"), mode)]
         if self.output_mode == "filtered":
             print("[PA::OP]", "Output files:", self.base_name+"_1.sam", self.base_name+"_2.sam")
-            return [open(os.path.join(self.base_path, self.base_name + "_1.sam"), "w"), open(os.path.join(self.base_path, self.base_name + "_2.sam"), "w")]
+            if not self.append_output:
+                if os.path.exists(os.path.join(self.base_path, self.base_name+"_1.sam")):
+                    os.remove(os.path.join(self.base_path, self.base_name+"_1.sam"))
+                if os.path.exists(os.path.join(self.base_path, self.base_name+"_2.sam")):
+                    os.remove(os.path.join(self.base_path, self.base_name+"_2.sam"))
+            return [open(os.path.join(self.base_path, self.base_name + "_1.sam"), mode), open(os.path.join(self.base_path, self.base_name + "_2.sam"), mode)]
         if self.output_mode == "splitfiltered":
             print("[PA::OP]", "Output directories:", self.base_name+"_1", self.base_name+"_2")
-            self.checkOutputDir(os.path.join(self.base_path, self.base_name+"_1"))
-            self.checkOutputDir(os.path.join(self.base_path, self.base_name+"_2"))
+            if not self.append_output:
+                self.checkOutputDir(os.path.join(self.base_path, self.base_name+"_1"))
+                self.checkOutputDir(os.path.join(self.base_path, self.base_name+"_2"))
             self.soft_file_limit = self.getOpenFileLimit()
             self.open_files = [{}, {}] # open file dicts, index 0 for read 1, 1 for read 2
             self.line_buffers = [{}, {}] # line buffers for each reference sequence, index 0 for read 1, 1 for read 2
@@ -835,13 +1018,14 @@ class Output:
 
     def checkOutputDir(self, path):
         """
-        Make the output path or check it is empty
+        Make the output path or empty it if it is not empty
         """
         # check the output directory and make if needed
         if os.path.exists(path):
             if len(os.listdir(path)) > 0:
-            # directory must be empty - this script will append to existing files on file name collision
-                raise ValueError("Output directory must be empty")
+                # remove all existing files
+                for file in os.listdir(path):
+                    os.remove(os.path.join(path, file))
         else:
             os.mkdir(path)
         
@@ -878,61 +1062,49 @@ class Output:
                                 referencename = entry[3:]
                         # setup output buffer for each reference sequence, with @SQ specific to output file
                         self.line_buffers[h][referencename] = []
-                        self.line_buffers[h][referencename].append(line)                
+                        self.line_buffers[h][referencename].append(line)
                     else:
                         # all other header lines to all files
                         for reference in self.line_buffers[h]:
                             self.line_buffers[h][reference].append(line)
 
-    def writeAlignment(self, lines_1, lines_2):
+    def writePreprocessed(self, output):
+        """
+        Writes lines preprocessed by the alignmentOutputPreprocess function
+        """
+        def bufferedLineWrite(dir, rname, lines):
+            # setup line buffer, if not already done for this rname
+            if rname not in self.line_buffers[dir]:
+                self.line_buffers[dir][rname] = []
+            # add to line buffer
+            self.line_buffers[dir][rname] += lines
+            # write buffer to file if too many lines buffered
+            if len(self.line_buffers[dir][rname]) > self.buffer_lines:
+                # check if too many files are open, and close first opened one if necessary
+                if len(self.open_files[dir]) >= self.soft_file_limit / 2:
+                    # get the first open file and write any buffered lines for that rname to it
+                    first_file = next(iter(self.open_files[dir]))
+                    self.writeLines(self.open_files[dir][first_file], self.line_buffers[dir][first_file])
+                    # close the first open file and remove from open files list
+                    self.open_files[dir][first_file].close()
+                    self.open_files[dir].pop(first_file)
+                # open the output file if necessary
+                if rname not in self.open_files[dir]:
+                    self.open_files[dir][rname] = open(os.path.join(self.output_paths[dir], rname+"_"+str(dir+1)+".sam"), "a")
+                # write lines and clear buffer
+                self.writeLines(self.open_files[dir][rname], self.line_buffers[dir][rname])
+                self.line_buffers[dir][rname] = []
+
         if self.output_mode == "filtered":
-            for l in range(len(lines_1)):
-                self.writeLines(self.output_paths[0], lines_1[l])
-                self.writeLines(self.output_paths[1], lines_2[l])
+            self.writeLines(self.output_paths[0], output[0])
+            self.writeLines(self.output_paths[1], output[1])
         if self.output_mode == "paired":
-            for l in range(len(lines_1)):
-                # for each read pair
-                if len(lines_1[l]) > 0 and len(lines_2[l]) > 0:
-                    # pick a random pair if multiple alignments, ensuring sequence data is included
-                    if len(lines_1[l]) > 1 or len(lines_2[l]) > 1:
-                        out_1, out_2 = random.choice(lines_1[l]), random.choice(lines_2[l])
-                        out_1.seq, out_1.qual = lines_1[l][0].seq, lines_1[l][0].qual
-                        out_2.seq, out_2.qual = lines_2[l][0].seq, lines_2[l][0].qual
-                        lines_1[l], lines_2[l] = [out_1], [out_2]
-                    # set pairing information
-                    lines_1[l][0].rnext, lines_2[l][0].rnext = lines_2[l][0].rname, lines_1[l][0].rname
-                    lines_1[l][0].pnext, lines_2[l][0].pnext = lines_2[l][0].pos, lines_1[l][0].pos  
-                    self.writeLines(self.output_paths[0], [lines_1[l][0], lines_2[l][0]])
-        if self.output_mode == "splitfiltered":
-            # append to appropriate buffer, only when rname is in buffer keys to exclude unmapped reads
-            lines = [lines_1, lines_2]
-            for dir in range(len(lines)):
-                # for left and right read
-                for l in range(len(lines[dir])):
-                    # for each read
-                    out_rnames = [] # each reference aligned to, so far
-                    for a in range(len(lines[dir][l])):
-                        # for each alignment
-                        rname = lines[dir][l][a].rname
-                        if rname in self.line_buffers[dir]: # only write to buffer if reference is in buffer, not unaligned sequcence
-                            if rname not in out_rnames:
-                                # first alignment to this reference, so infill sequence data
-                                out_rnames.append(rname)
-                                lines[dir][l][a].seq, lines[dir][l][a].qual = lines[dir][l][0].seq, lines[dir][l][0].qual
-                            # append to buffer
-                            self.line_buffers[dir][rname].append(lines[dir][l][a])
-                            # write buffer to file if too many lines buffered
-                            if len(self.line_buffers[dir][rname]) > self.buffer_lines:
-                                # check if too many files are open, and close first opened one if necessary
-                                if len(self.open_files[dir]) >= self.soft_file_limit / 2:
-                                    first_file = next(iter(self.open_files[dir]))
-                                    self.open_files[dir][first_file].close()
-                                    self.open_files[dir].pop(first_file)
-                                # write buffer to file
-                                if rname not in self.open_files[dir]:
-                                    self.open_files[dir][rname] = open(os.path.join(self.output_paths[dir], rname+"_"+str(dir+1)+".sam"), "w")
-                                self.writeLines(self.open_files[dir][rname], self.line_buffers[dir][rname])
-                                self.line_buffers[dir][rname] = []
+            self.writeLines(self.output_paths[0], output)
+        if self.output_mode == "splitfiltered" or self.output_mode == "split":
+            for rname in output[0]:
+                bufferedLineWrite(0, rname, output[0][rname])
+            for rname in output[1]:
+                bufferedLineWrite(1, rname, output[1][rname])
 
     def closeOutput(self):
         if self.base_path == "-":
