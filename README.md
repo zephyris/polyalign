@@ -1,4 +1,4 @@
-# OrfFinder
+# PolyAlign
 
 A simple Python and BWA MEM-based aligner with improved read pairing.
 
@@ -10,7 +10,7 @@ It is heavily inspired by `polypolish align` from [Polypolish](https://github.co
 
 ### Dependencies
 
-OrfFinder requires `python`, and is easiest to install using `pip` and `git`. It also requires `bwa` to be installed and available to the system command line.
+PolyAlign requires `python`, and is easiest to install using `pip` and `git`. It also requires `bwa` to be installed and available to the system command line.
 
 On Linux, install using your normal package manager, for example:
 ``` shell
