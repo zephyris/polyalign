@@ -8,25 +8,15 @@ It is heavily inspired by `polypolish align` from [Polypolish](https://github.co
 
 ## Installation
 
-### Dependencies
-
 PolyAlign requires `python`, and is easiest to install using `pip` and `git`. It also requires `bwa` to be installed and available to the system command line.
 
-On Linux, install using your normal package manager, for example:
+On Linux, install dependencies using your normal package manager, for example:
 ``` shell
 sudo apt update
 sudo apt install bwa python3 python3-pip git
 ```
 
-Alternatively, `bwa` can be installed in a conda environment by running
-```shell
-conda install -c bioconda bwa
-```
-Please see the [Conda documentation](https://conda.io/projects/conda/en/latest/user-guide/install/index.html) on how to install conda.
-
-### Polyalign
-
-Install using `pip` and `git`:
+Install PolyAlign using `pip` and `git`:
 ``` shell
 pip install git+https://github.com/zephyris/polyalign
 ```
@@ -39,6 +29,22 @@ pip install --upgrade --force-reinstall git+https://github.com/zephyris/polyalig
 To uninstall use `pip`
 ``` shell
 pip uninstall polyalign
+```
+
+### Conda
+
+You may want to set up PolyAlign in a python virtual environment, like conda.
+Please see the [Conda documentation](https://conda.io/projects/conda/en/latest/user-guide/install/index.html) on how to install conda.
+
+Dependencies can be installed in a conda environment by running:
+```shell
+conda install git pip
+conda install -c bioconda bwa 
+```
+
+PolyAlign can be installed using `pip` and `git` as above:
+```shell
+pip install git+https://github.com/zephyris/polyalign
 ```
 
 ## Standalone usage
@@ -69,5 +75,16 @@ You can use `polyalign` in your Python scripts - however it is subject to change
 ## History and citing
 
 This module was written to optimise polishing of small eukaryotic genomes assembled from noisy Nanopore data. The Polypolish strategy for polishing repetitive sequences is very promising, but designed for small (bacterial) genomes. Polyalign allows application of the same method to larger, eg. eukarotic genomes, without requiring enormous computational resources.
+
+For example:
+```shell
+python3 -m polyalign splitfiltered genome.fasta illumina1.fq illumina2.fq outputname
+python3 -m polyalign splitfasta genome.fasta outputname
+for fasta in outputname/*.fasta; do
+  filename=$(basename "$fasta")
+  filename="${filename%.*}"
+  polypolish polish $fasta outputname_1/${filename}_1.sam outputname_2/${filename}_2.sam >> polishedgenome.fasta
+done
+```
 
 I haven't ultimately used it for a published genome assembly, but I've made it available in case it is useful. Please send me a message and cite this Github repository if you are publishing anything using this as a tool. Please also cite Polypolish, as this is _very_ closely modeled on that work.
